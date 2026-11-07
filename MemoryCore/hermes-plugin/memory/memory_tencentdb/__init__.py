@@ -17,6 +17,12 @@ Config via environment variables:
                                   unset, the provider auto-discovers
                                   ``src/gateway/server.ts`` next to the plugin
                                   checkout or under ``$HOME``)
+  MEMORY_TENCENTDB_KNOWLEDGE_HOST — MemoryKnowledge (wiki) host (default: 127.0.0.1)
+  MEMORY_TENCENTDB_KNOWLEDGE_PORT — MemoryKnowledge (wiki) port (default: 8421)
+  MEMORY_TENCENTDB_KNOWLEDGE_TEAM — Team whose wiki libraries are listed
+                                     (default: default; reads are not
+                                     team-scoped, so every profile sees the
+                                     same corpus)
 
 The on-disk data directory (L0~L3 storage) is owned by the Gateway, not by
 this provider. Point the Gateway at a custom location with ``TDAI_DATA_DIR``
@@ -39,7 +45,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
 
-from .client import MemoryTencentdbSdkClient
+from .client import MemoryKnowledgeWikiClient, MemoryTencentdbSdkClient
 from .supervisor import GatewaySupervisor
 
 logger = logging.getLogger(__name__)
@@ -81,6 +87,59 @@ _DEFAULT_GATEWAY_PORT = 8420
 _DEFAULT_TEAM_ID = "team-ohgfaxy8um"
 _DEFAULT_AGENT_ID = "default"
 _DEFAULT_USER_ID = "default"
+
+# MemoryKnowledge (wiki service) networking defaults. The wiki corpus lives in
+# a separate process from the memory Gateway, so it gets its own host/port.
+_DEFAULT_KNOWLEDGE_HOST = "127.0.0.1"
+_DEFAULT_KNOWLEDGE_PORT = 8421
+# Team used when listing wiki libraries. The corpus itself is NOT team-scoped
+# for reads (``/v3/tools/call`` keys off ``knowledge_id`` alone), so every
+# Hermes profile sees the same libraries regardless of this value.
+_DEFAULT_KNOWLEDGE_TEAM = "default"
+# How many wiki libraries a cross-library search fans out to.
+_MAX_WIKI_FANOUT = 8
+
+
+def _resolve_knowledge_port(default: int = _DEFAULT_KNOWLEDGE_PORT) -> int:
+    """Resolve MEMORY_TENCENTDB_KNOWLEDGE_PORT with validation."""
+    raw = os.environ.get("MEMORY_TENCENTDB_KNOWLEDGE_PORT")
+    if raw is None or not raw.strip():
+        return default
+    try:
+        port = int(raw.strip())
+    except ValueError:
+        logger.warning(
+            "Invalid MEMORY_TENCENTDB_KNOWLEDGE_PORT=%r (not an integer); "
+            "falling back to default %d.",
+            raw, default,
+        )
+        return default
+    if not (1 <= port <= 65535):
+        logger.warning(
+            "MEMORY_TENCENTDB_KNOWLEDGE_PORT=%d is out of range (1..65535); "
+            "falling back to default %d.",
+            port, default,
+        )
+        return default
+    return port
+
+
+def _resolve_knowledge_host(default: str = _DEFAULT_KNOWLEDGE_HOST) -> str:
+    """Resolve MEMORY_TENCENTDB_KNOWLEDGE_HOST, trimming whitespace."""
+    raw = os.environ.get("MEMORY_TENCENTDB_KNOWLEDGE_HOST")
+    if raw is None:
+        return default
+    host = raw.strip()
+    return host or default
+
+
+def _resolve_knowledge_team(default: str = _DEFAULT_KNOWLEDGE_TEAM) -> str:
+    """Resolve MEMORY_TENCENTDB_KNOWLEDGE_TEAM (which team's libraries to list)."""
+    raw = os.environ.get("MEMORY_TENCENTDB_KNOWLEDGE_TEAM")
+    if raw is None:
+        return default
+    team = raw.strip()
+    return team or default
 
 
 def _resolve_user_id(default: str = _DEFAULT_USER_ID) -> str:
@@ -305,7 +364,7 @@ READ_SCENE_SCHEMA = {
     "name": "memory_tencentdb_read_scene",
     "description": (
         "Read a scene block's full content by its name. "
-        "Use when you see a scene listed in the available scenes and want to "
+        "Use this when you see a scene listed in the available scenes and want to "
         "retrieve detailed information from that scene."
     ),
     "parameters": {
@@ -320,6 +379,74 @@ READ_SCENE_SCHEMA = {
     },
 }
 
+WIKI_SEARCH_SCHEMA = {
+    "name": "memory_tencentdb_wiki_search",
+    "description": (
+        "Search structured knowledge-base (wiki) pages — domain reference material "
+        "such as engineering runbooks, spec sheets, and troubleshooting procedures. "
+        "Use this for 'how do I do X' / 'what is the spec for Y' questions about a "
+        "documented domain; use memory_tencentdb_memory_search instead for facts "
+        "about the user or past conversations. Optionally narrow to one library; "
+        "omit knowledge_id to search every visible library."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Search query (keywords work best).",
+            },
+            "knowledge_id": {
+                "type": "string",
+                "description": (
+                    "Optional library id (e.g. 'wiki-u9olfgjd'). Omit to search all "
+                    "visible libraries. Use memory_tencentdb_wiki_list to see them."
+                ),
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of results per library (default: 5, max: 20).",
+            },
+        },
+        "required": ["query"],
+    },
+}
+
+WIKI_LIST_SCHEMA = {
+    "name": "memory_tencentdb_wiki_list",
+    "description": (
+        "List the available knowledge-base libraries (wiki ids, names, page counts) "
+        "so you can target a specific one with memory_tencentdb_wiki_search."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
+
+WIKI_READ_SCHEMA = {
+    "name": "memory_tencentdb_wiki_read",
+    "description": (
+        "Read the full content of a knowledge-base page returned by "
+        "memory_tencentdb_wiki_search (use its 'path' field)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "knowledge_id": {
+                "type": "string",
+                "description": "Library id the page belongs to (e.g. 'wiki-u9olfgjd').",
+            },
+            "path": {
+                "type": "string",
+                "description": "Page path as returned by search, e.g. 'wiki/concepts/光猫桥接模式.md'.",
+            },
+        },
+        "required": ["knowledge_id", "path"],
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # MemoryProvider implementation
@@ -331,6 +458,7 @@ class MemoryTencentdbProvider(MemoryProvider):
     def __init__(self):
         self._supervisor: Optional[GatewaySupervisor] = None
         self._client: Optional[MemoryTencentdbSdkClient] = None
+        self._wiki_client: Optional[MemoryKnowledgeWikiClient] = None
         self._session_id = ""
         self._user_id = _DEFAULT_USER_ID
         self._team_id = _DEFAULT_TEAM_ID
@@ -565,6 +693,14 @@ class MemoryTencentdbProvider(MemoryProvider):
         # config, then to DEFAULT_AGENT_ID ("default").
         self._agent_id = kwargs.get("agent_identity") or kwargs.get("agent_id", _DEFAULT_AGENT_ID)
 
+        # Wiki service (MemoryKnowledge) — a separate process from the memory
+        # Gateway, so it is never supervised by this provider. The corpus is
+        # shared across profiles, so every profile builds the same client.
+        self._wiki_client = MemoryKnowledgeWikiClient(
+            base_url=f"http://{_resolve_knowledge_host()}:{_resolve_knowledge_port()}",
+            timeout=10,
+        )
+
         host = _resolve_gateway_host()
         port = _resolve_gateway_port()
         gateway_cmd = os.environ.get("MEMORY_TENCENTDB_GATEWAY_CMD") or _discover_gateway_cmd()
@@ -616,8 +752,13 @@ class MemoryTencentdbProvider(MemoryProvider):
         self._start_watchdog()
 
     def system_prompt_block(self) -> str:
+        wiki_line = (
+            "A shared knowledge base (wiki) is also available: use "
+            "memory_tencentdb_wiki_search for domain reference material (runbooks, "
+            "specs, procedures) and memory_tencentdb_wiki_list to see libraries."
+        )
         if not self._gateway_available:
-            return ""
+            return wiki_line
         return (
             "# memory-tencentdb Memory\n"
             f"Active. Team: {self._team_id}, Agent: {self._agent_id}, User: {self._user_id}.\n"
@@ -625,7 +766,8 @@ class MemoryTencentdbProvider(MemoryProvider):
             "capture, structured memory extraction, scene blocks, and persona synthesis.\n"
             "Use memory_tencentdb_memory_search to find specific memories, "
             "memory_tencentdb_conversation_search to search raw conversation history, "
-            "memory_tencentdb_read_scene to read detailed scene content."
+            "memory_tencentdb_read_scene to read detailed scene content.\n"
+            + wiki_line
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
@@ -845,13 +987,24 @@ class MemoryTencentdbProvider(MemoryProvider):
     # -- Tools ----------------------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        if self._gateway_available or self._initialized:
-            return [MEMORY_SEARCH_SCHEMA, CONVERSATION_SEARCH_SCHEMA, READ_SCENE_SCHEMA]
-        if os.environ.get("MEMORY_TENCENTDB_GATEWAY_CMD") or os.environ.get("MEMORY_TENCENTDB_GATEWAY_PORT"):
-            return [MEMORY_SEARCH_SCHEMA, CONVERSATION_SEARCH_SCHEMA, READ_SCENE_SCHEMA]
-        return []
+        # The wiki tools talk to MemoryKnowledge, a different service from the
+        # memory Gateway, so they are always offered — gating them on the
+        # Gateway's health would hide them for no reason.
+        return [
+            MEMORY_SEARCH_SCHEMA,
+            CONVERSATION_SEARCH_SCHEMA,
+            READ_SCENE_SCHEMA,
+            WIKI_SEARCH_SCHEMA,
+            WIKI_LIST_SCHEMA,
+            WIKI_READ_SCHEMA,
+        ]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+        # Wiki tools bypass the Gateway health gate: they target MemoryKnowledge
+        # (a separate process), so a Gateway outage must not disable them.
+        if tool_name in ("memory_tencentdb_wiki_search", "memory_tencentdb_wiki_list", "memory_tencentdb_wiki_read"):
+            return self._handle_wiki_tool(tool_name, args)
+
         self._ensure_alive_for_request()
         if not self._client:
             return json.dumps({
@@ -930,6 +1083,113 @@ class MemoryTencentdbProvider(MemoryProvider):
             self._try_recover_gateway()
             return json.dumps({"error": f"Tool call failed: {e}"})
 
+    # -- Wiki tools (MemoryKnowledge service) ---------------------------------
+
+    def _wiki_client_or_error(self):
+        """Return (client, error_json). The wiki client is created in
+        initialize(); recreate it lazily if the provider was used without one."""
+        if self._wiki_client is None:
+            self._wiki_client = MemoryKnowledgeWikiClient(
+                base_url=f"http://{_resolve_knowledge_host()}:{_resolve_knowledge_port()}",
+                timeout=10,
+            )
+        return self._wiki_client, None
+
+    def _wiki_libraries(self, client) -> List[Dict[str, Any]]:
+        """Libraries visible to the configured team, ready for searching."""
+        items = client.list_wikis(team_id=_resolve_knowledge_team())
+        ready = [w for w in items if w.get("status") == "ready"]
+        # Fall back to all libraries when none is marked ready (a fresh install
+        # may not have set the flag yet) rather than returning nothing.
+        return ready or items
+
+    def _handle_wiki_tool(self, tool_name: str, args: Dict[str, Any]) -> str:
+        """Handle the wiki tools. Errors here never touch the memory Gateway's
+        circuit breaker — a wiki outage must not disable memory search."""
+        client, err = self._wiki_client_or_error()
+        if err:
+            return err
+
+        try:
+            if tool_name == "memory_tencentdb_wiki_list":
+                libs = self._wiki_libraries(client)
+                if not libs:
+                    return "No knowledge libraries are available."
+                lines = []
+                for w in libs:
+                    lines.append(
+                        f"- {w.get('wiki_id')} | {w.get('name')} | "
+                        f"pages={w.get('page_count', '?')} | status={w.get('status', '?')}"
+                    )
+                return "\n".join(lines)
+
+            if tool_name == "memory_tencentdb_wiki_search":
+                query = (args.get("query") or "").strip()
+                if not query:
+                    return json.dumps({"error": "Missing required parameter: query"})
+                limit = _coerce_limit(args.get("limit"))
+                knowledge_id = (args.get("knowledge_id") or "").strip()
+
+                if knowledge_id:
+                    targets = [knowledge_id]
+                    names = {knowledge_id: ""}
+                else:
+                    libs = self._wiki_libraries(client)
+                    if not libs:
+                        return "No knowledge libraries are available."
+                    targets = [w.get("wiki_id") for w in libs[:_MAX_WIKI_FANOUT] if w.get("wiki_id")]
+                    names = {w.get("wiki_id"): w.get("name", "") for w in libs}
+
+                hits = []
+                errors = []
+                for kid in targets:
+                    if not kid:
+                        continue
+                    try:
+                        raw = client.call_tool(
+                            kid, "search", {"query": query, "limit": limit}
+                        )
+                        results = (raw.get("data") or {}).get("results") or []
+                        for r in results:
+                            hits.append((r.get("score", 0), kid, names.get(kid, ""), r))
+                    except Exception as e:
+                        errors.append(f"{kid}: {e}")
+
+                if not hits:
+                    if errors:
+                        return json.dumps({"error": "Wiki search failed", "detail": errors})
+                    return f"No wiki pages found for '{query}'."
+
+                hits.sort(key=lambda t: t[0], reverse=True)
+                lines = []
+                for score, kid, name, r in hits:
+                    label = f"{name} ({kid})" if name else kid
+                    lines.append(
+                        f"- [{label}] {r.get('title', '')} (score {score:.2f})\n"
+                        f"  path: {r.get('path', '')}\n"
+                        f"  {r.get('snippet', '').strip()}"
+                    )
+                return "\n".join(lines)
+
+            if tool_name == "memory_tencentdb_wiki_read":
+                knowledge_id = (args.get("knowledge_id") or "").strip()
+                path = (args.get("path") or "").strip()
+                if not knowledge_id:
+                    return json.dumps({"error": "Missing required parameter: knowledge_id"})
+                if not path:
+                    return json.dumps({"error": "Missing required parameter: path"})
+                raw = client.call_tool(knowledge_id, "read_page", {"refs": [path]})
+                items = (raw.get("data") or {}).get("items") or []
+                if not items:
+                    return f"Page '{path}' is empty or not found in {knowledge_id}."
+                return "\n\n".join(item.get("content", "") for item in items)
+
+            return json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+        except Exception as e:
+            logger.warning("memory-tencentdb wiki tool %s failed: %s", tool_name, e)
+            return json.dumps({"error": f"Wiki tool call failed: {e}"})
+
     # -- Optional hooks -------------------------------------------------------
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
@@ -963,6 +1223,33 @@ class MemoryTencentdbProvider(MemoryProvider):
                 "key": "gateway_cmd",
                 "description": "Command to start the memory-tencentdb Gateway (e.g. 'node --import tsx /path/to/server.ts')",
                 "env_var": "MEMORY_TENCENTDB_GATEWAY_CMD",
+                "required": False,
+            },
+            {
+                "key": "knowledge_host",
+                "description": (
+                    "MemoryKnowledge (wiki service) host — serves the shared "
+                    "knowledge base searched by memory_tencentdb_wiki_search."
+                ),
+                "default": "127.0.0.1",
+                "env_var": "MEMORY_TENCENTDB_KNOWLEDGE_HOST",
+                "required": False,
+            },
+            {
+                "key": "knowledge_port",
+                "description": "MemoryKnowledge (wiki service) port.",
+                "default": "8421",
+                "env_var": "MEMORY_TENCENTDB_KNOWLEDGE_PORT",
+                "required": False,
+            },
+            {
+                "key": "knowledge_team",
+                "description": (
+                    "Team whose knowledge libraries are listed. Reads are not "
+                    "team-scoped — every profile sees the same corpus."
+                ),
+                "default": "default",
+                "env_var": "MEMORY_TENCENTDB_KNOWLEDGE_TEAM",
                 "required": False,
             },
             {

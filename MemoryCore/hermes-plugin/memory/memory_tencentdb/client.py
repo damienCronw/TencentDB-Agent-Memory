@@ -19,6 +19,101 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 10  # seconds
 
+# MemoryKnowledge (the wiki service) is a separate process from the memory
+# Gateway: Gateway :8420 owns L0-L3 memory, Knowledge :8421 owns the wiki
+# corpus (raw sources -> ingest -> structured pages + BM25 index).
+DEFAULT_KNOWLEDGE_PORT = 8421
+DEFAULT_KNOWLEDGE_TEAM = "default"
+
+
+class MemoryKnowledgeWikiClient:
+    """HTTP client for the MemoryKnowledge wiki service.
+
+    Separate base URL from the memory Gateway on purpose: the wiki corpus is
+    service-level and shared by every agent, so ``/v3/tools/call`` deliberately
+    ignores ``team_id`` and keys off ``knowledge_id`` alone. That makes the
+    same wiki reachable from every Hermes profile without per-profile wiring.
+    """
+
+    def __init__(
+        self,
+        base_url: str = f"http://127.0.0.1:{DEFAULT_KNOWLEDGE_PORT}",
+        timeout: int = DEFAULT_TIMEOUT,
+        api_key: Optional[str] = None,
+    ):
+        self._base_url = base_url.rstrip("/")
+        self._timeout = timeout
+        self._api_key = (api_key or "").strip() or None
+
+    def _headers(self) -> Dict[str, str]:
+        headers = {
+            "Content-Type": "application/json",
+            "x-tdai-service-id": "knowledge",
+        }
+        # The wiki service accepts an unauthenticated request; send the token
+        # only when one is configured, so a gateway key never leaks to it.
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        return headers
+
+    def _post(self, path: str, body: Dict[str, Any], timeout: Optional[int] = None) -> Dict[str, Any]:
+        url = f"{self._base_url}{path}"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode("utf-8"),
+            headers=self._headers(),
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout or self._timeout) as resp:
+                raw = json.loads(resp.read().decode("utf-8"))
+                if raw.get("code", 0) != 0:
+                    logger.warning(
+                        "MemoryKnowledge %s returned code=%s: %s",
+                        path, raw.get("code"), raw.get("message"),
+                    )
+                return raw
+        except urllib.error.HTTPError as e:
+            body_text = ""
+            try:
+                body_text = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            logger.warning("MemoryKnowledge %s returned %d: %s", path, e.code, body_text[:500])
+            raise
+        except Exception as e:
+            logger.debug("MemoryKnowledge %s failed: %s", path, e)
+            raise
+
+    # -- API methods ----------------------------------------------------------
+
+    def health(self, timeout: int = 3) -> Dict[str, Any]:
+        """Check whether the wiki service is up."""
+        url = f"{self._base_url}/health"
+        req = urllib.request.Request(url, headers=self._headers(), method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def list_wikis(self, team_id: str = DEFAULT_KNOWLEDGE_TEAM) -> List[Dict[str, Any]]:
+        """List wiki libraries visible to ``team_id``."""
+        raw = self._post("/v3/wiki/list", {"team_id": team_id})
+        items = (raw.get("data") or {}).get("items") or []
+        return items
+
+    def call_tool(
+        self,
+        knowledge_id: str,
+        tool_name: str,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Invoke a wiki tool (``search`` / ``list_pages`` / ``read_page`` / ...)."""
+        body: Dict[str, Any] = {
+            "knowledge_id": knowledge_id,
+            "tool_name": tool_name,
+            "params": params or {},
+        }
+        return self._post("/v3/tools/call", body)
+
 
 class MemoryTencentdbSdkClient:
     """HTTP client for the memory-tencentdb Gateway sidecar."""
