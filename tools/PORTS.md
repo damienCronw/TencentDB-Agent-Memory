@@ -27,7 +27,8 @@ python3 tools/scan_ports.py --json         # JSON 输出
 | 8421 | node | **TDAI MemoryKnowledge** — 知识库 | 勿占 |
 | 8123 | node | **TDAI MemoryPanel** — Web 控制台 | 勿占 |
 | 8096 | node | **TDAI MemoryProxy** — 记忆代理入口（opencode / dsh 走这里） | 勿占 |
-| 11434 | ollama | Ollama — 本地 LLM 服务 | 勿占 |
+| 11434 | ollama | Ollama — 本地 LLM 服务（TDAI 的 LLM：qwen3.8:27b-mlx） | 勿占 |
+| 11435 | ollama | Ollama — **TDAI 专用 embedding 实例**（bge-m3，与 11434 的 LLM 隔离） | 勿占 |
 | 19333 | python | OpenViking — 记忆服务 | 勿占 |
 | 5432 | postgres | PostgreSQL 17 | 勿占 |
 | 1883 | mosquitto | MQTT broker | 别动 |
@@ -38,8 +39,8 @@ python3 tools/scan_ports.py --json         # JSON 输出
 
 | 端口 | 服务 | 状态 |
 |---|---|---|
-| 6379 | Redis (homebrew) | 已装，未运行 |
-| 5672 / 15672 | RabbitMQ | 已装，未运行 |
+| 6379 | Redis (homebrew) | **2026-11-07 已卸载**（TDAI 走 local state backend，MemoryProxy 的 `redis.enabled=false`） |
+| 5672 / 15672 | RabbitMQ | **2026-11-07 已卸载**（连同 Erlang，零引用） |
 
 ---
 
