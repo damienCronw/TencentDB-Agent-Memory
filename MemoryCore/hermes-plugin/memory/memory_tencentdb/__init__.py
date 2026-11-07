@@ -78,9 +78,29 @@ _DEFAULT_GATEWAY_HOST = "127.0.0.1"
 _DEFAULT_GATEWAY_PORT = 8420
 
 # Default tenancy IDs for v3 isolation.
-_DEFAULT_TEAM_ID = "default"
+_DEFAULT_TEAM_ID = "team-ohgfaxy8um"
 _DEFAULT_AGENT_ID = "default"
 _DEFAULT_USER_ID = "default"
+
+
+def _resolve_user_id(default: str = _DEFAULT_USER_ID) -> str:
+    """
+    Resolve the user_id dimension for memory writes.
+
+    Priority:
+      1. Explicit ``user_id`` kwarg from Hermes core (chat sessions carry it).
+      2. ``MEMORY_TENCENTDB_USER_ID`` env — global override, so scheduled
+         jobs (which have no user context) write under the same user_id
+         as interactive sessions. Without this, cron output lands under
+         "default" and becomes invisible to every later read.
+      3. ``HERMES_SESSION_USER_ID`` env — per-session value.
+      4. Fallback to ``default``.
+    """
+    for var in ("MEMORY_TENCENTDB_USER_ID", "HERMES_SESSION_USER_ID"):
+        raw = os.environ.get(var)
+        if raw and raw.strip():
+            return raw.strip()
+    return default
 
 
 def _resolve_gateway_port(default: int = _DEFAULT_GATEWAY_PORT) -> int:
@@ -537,9 +557,13 @@ class MemoryTencentdbProvider(MemoryProvider):
         All default to "default".
         """
         self._session_id = session_id
-        self._user_id = kwargs.get("user_id", _DEFAULT_USER_ID)
+        # 显式 kwarg 优先；缺失时走环境变量回落（cronjob 等无用户上下文的场景）
+        self._user_id = kwargs.get("user_id") or _resolve_user_id()
         self._team_id = kwargs.get("team_id", _DEFAULT_TEAM_ID)
-        self._agent_id = kwargs.get("agent_id", _DEFAULT_AGENT_ID)
+        # Map Hermes core's agent_identity (profile name) to agent_id for proper
+        # per-profile tenancy isolation. Falls back to agent_id kwarg for explicit
+        # config, then to DEFAULT_AGENT_ID ("default").
+        self._agent_id = kwargs.get("agent_identity") or kwargs.get("agent_id", _DEFAULT_AGENT_ID)
 
         host = _resolve_gateway_host()
         port = _resolve_gateway_port()

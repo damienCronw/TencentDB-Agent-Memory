@@ -83,7 +83,7 @@ function rrfMergeL0(...lists: ConversationSearchResultItem[][]): ConversationSea
 // Search implementation
 // ============================
 
-export async function executeConversationSearch(params: {
+async function runConversationSearch(params: {
   query: string;
   limit: number;
   sessionKey?: string;
@@ -288,6 +288,58 @@ export async function executeConversationSearch(params: {
     total: trimmed.length,
     strategy,
   };
+}
+
+// ============================
+// Entry point — with user_id fallback
+// ============================
+
+/**
+ * 检索 L0 会话记录，并在 user_id 维度失效时自动降级。
+ *
+ * 背景：不同客户端携带 user_id 的行为不一致 —— Hermes 插件传 `uid:501`，
+ * 而部分客户端（重连补发、非插件路径）漏传时会回落到 `default`。
+ * 一旦写入方的 user_id 与读取方不一致，对应的记忆就会**永久不可见**。
+ *
+ * 策略：先按完整隔离维度检索；若命中 0 条且 filter 里带 userId，
+ * 则去掉 userId 维度重试一次（team / agent 隔离仍然生效）。
+ * 这样既补上了漏传场景的盲区，又不会跨 agent / 跨 team 泄漏数据。
+ */
+export async function executeConversationSearch(params: {
+  query: string;
+  limit: number;
+  sessionKey?: string;
+  filter?: IsolationFilter;
+  vectorStore?: IMemoryStore;
+  embeddingService?: EmbeddingService;
+  logger?: Logger;
+}): Promise<ConversationSearchResult> {
+  const result = await runConversationSearch(params);
+
+  const userId = params.filter?.userId;
+  if (result.results.length > 0 || !userId || result.strategy === "none") {
+    return result;
+  }
+
+  // 去掉 userId 维度重试：team / agent / task / session 隔离保持不变
+  const relaxedFilter: IsolationFilter = { ...params.filter };
+  delete relaxedFilter.userId;
+
+  params.logger?.debug?.(
+    `${TAG} [fallback] userId="${userId}" 命中 0 条，去掉 userId 维度重试`,
+  );
+
+  const retry = await runConversationSearch({ ...params, filter: relaxedFilter });
+
+  if (retry.results.length > 0) {
+    params.logger?.debug?.(
+      `${TAG} [fallback] 降级命中 ${retry.results.length} 条（strategy=${retry.strategy}）`,
+    );
+    return retry;
+  }
+
+  params.logger?.debug?.(`${TAG} [fallback] 降级后仍为 0 条，返回原始空结果`);
+  return result;
 }
 
 // ============================

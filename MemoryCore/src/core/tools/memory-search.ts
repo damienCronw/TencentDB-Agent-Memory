@@ -75,7 +75,7 @@ function hasNativeL1Hybrid(store: IMemoryStore): boolean {
 // Search implementation
 // ============================
 
-export async function executeMemorySearch(params: {
+async function runMemorySearch(params: {
   query: string;
   limit: number;
   type?: string;
@@ -169,6 +169,54 @@ export async function executeMemorySearch(params: {
     total: trimmed.length,
     strategy: recalled.strategy,
   };
+}
+
+// ============================
+// Entry point — with user_id fallback
+// ============================
+
+/**
+ * 检索 L1 记忆，并在 user_id 维度失效时自动降级。
+ *
+ * 与 L0 检索同源的问题：写入方与读取方的 user_id 不一致时，记忆会永久不可见。
+ * 先按完整隔离维度检索；命中 0 条且 filter 带 userId 时，去掉 userId 维度
+ * 重试一次（team / agent 隔离仍生效）。
+ */
+export async function executeMemorySearch(params: {
+  query: string;
+  limit: number;
+  type?: string;
+  scene?: string;
+  filter?: IsolationFilter;
+  vectorStore?: IMemoryStore;
+  embeddingService?: EmbeddingService;
+  logger?: Logger;
+}): Promise<MemorySearchResult> {
+  const result = await runMemorySearch(params);
+
+  const userId = params.filter?.userId;
+  if (result.results.length > 0 || !userId || result.strategy === "none") {
+    return result;
+  }
+
+  const relaxedFilter: IsolationFilter = { ...params.filter };
+  delete relaxedFilter.userId;
+
+  params.logger?.debug?.(
+    `${TAG} [fallback] userId="${userId}" 命中 0 条，去掉 userId 维度重试`,
+  );
+
+  const retry = await runMemorySearch({ ...params, filter: relaxedFilter });
+
+  if (retry.results.length > 0) {
+    params.logger?.debug?.(
+      `${TAG} [fallback] 降级命中 ${retry.results.length} 条（strategy=${retry.strategy}）`,
+    );
+    return retry;
+  }
+
+  params.logger?.debug?.(`${TAG} [fallback] 降级后仍为 0 条，返回原始空结果`);
+  return result;
 }
 
 // ============================
