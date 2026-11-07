@@ -166,6 +166,12 @@ export type ChatMemoryContentCleaner = (params: {
   agentId: string;
 }) => Promise<void>;
 
+/** MongoDB duplicate-key error shape (E11000). */
+interface MongoDuplicateKeyError extends Error {
+  code?: number;
+  keyPattern?: Record<string, unknown>;
+}
+
 /** Detect unique constraint violation (SQLite UNIQUE or MongoDB E11000) on a specific column. */
 function isUniqueViolation(err: unknown, column?: string): boolean {
   if (!(err instanceof Error)) return false;
@@ -173,9 +179,10 @@ function isUniqueViolation(err: unknown, column?: string): boolean {
   if (/UNIQUE constraint failed/.test(msg)) {
     return column ? msg.includes(column) : true;
   }
-  if ((err as any).code === 11000) {
+  const mongoErr = err as MongoDuplicateKeyError;
+  if (mongoErr.code === 11000) {
     if (!column) return true;
-    const kp = (err as any).keyPattern;
+    const kp = mongoErr.keyPattern;
     return kp ? column in kp : msg.includes(column);
   }
   return false;
@@ -1426,6 +1433,48 @@ export class MetadataService {
   }
 
   /**
+   * 解析记忆命名空间对应的 agent 主体。
+   *
+   * Hub 的 agent_id 形如 `agt-xxxxxxxxxxxx`，而 Hermes 侧以 profile 名
+   * （`default` / `drawing` / `turing` / `tdai` / `odoo`）作为记忆隔离维度。
+   * 两套标识不同源，所以：
+   *   1. 先按 agent_id 精确匹配（proxy / opencode / dsh 走的正常路径）；
+   *   2. 未命中时按 `metadata_json.hermes_profile` 反查（Hermes profile 路径）。
+   *
+   * 命中后 asset_id 仍用原始记忆 id 构造，只有 owner 与绑定关系落到真实 agent。
+   */
+  private async resolveAgentForMemory(
+    teamId: string,
+    agentId: string,
+  ): Promise<AgentEntity | null> {
+    const direct = await this.getAgentById(agentId);
+    if (direct) return direct;
+
+    try {
+      const page = await this.store.listAgentsByTeam(
+        teamId,
+        { limit: 500, offset: 0 },
+        undefined,
+      );
+      for (const candidate of page.items) {
+        if (!candidate.metadata_json) continue;
+        try {
+          const meta = JSON.parse(candidate.metadata_json) as {
+            hermes_profile?: string;
+          } | null;
+          if (meta && meta.hermes_profile === agentId) return candidate;
+        } catch {
+          // metadata_json 非法时跳过该 agent，不影响其他候选
+        }
+      }
+    } catch (err) {
+      // 兜底查询失败不应放大成业务错误，走原有的 agent_not_found 分支
+      void err;
+    }
+    return null;
+  }
+
+  /**
    * 幂等确保 (team, agent) 对应的 chat_memory 资产存在并已绑定到 agent。
    *
    * 首次调用时会同步完成三件事（严格顺序）：
@@ -1448,21 +1497,11 @@ export class MetadataService {
     team_id: string;
     agent_id: string;
   }): Promise<AssetEntity> {
-    const assetId = buildChatMemoryAssetId(params.team_id, params.agent_id);
-
-    // 1. 缓存短路：已确认存在直接返回轻量占位（如果调用方需要实体，才回 store）
-    //    实践中调用方并不消费返回值（fire-and-forget），命中缓存时不再查 store。
-    if (this.ensuredChatMemoryAssets.has(assetId)) {
-      const cached = await this.getAssetById(assetId);
-      if (cached) return cached;
-      // 缓存脏了（被外部删除）—— 清掉重来
-      this.ensuredChatMemoryAssets.delete(assetId);
-    }
-
-    // 2. 拿 agent，取 owner + team 用于 create + canBindAsset
-    //    先拉 agent 是为了在任何路径下都能校验 team_mismatch，同时后续 bind
-    //    要用到 owner_user_id 作 created_by。
-    const agent = await this.getAgentById(params.agent_id);
+    // 1. 先解析 agent：Hermes 插件以 profile 名（drawing / tdai …）作为记忆
+    //    命名空间，与 Hub 的 agt-xxx 不同源，故按 metadata_json.hermes_profile
+    //    兜底解析出真实 Hub agent。asset_id 必须用**解析后**的 agent_id 生成，
+    //    否则会产出 Hub 侧无法反查的孤儿资产（resolveChatMemoryAgentId 不认）。
+    const agent = await this.resolveAgentForMemory(params.team_id, params.agent_id);
     if (!agent) {
       throw new MetadataError(
         "agent_not_found",
@@ -1475,6 +1514,17 @@ export class MetadataService {
         `cannot ensure chat_memory asset: agent ${params.agent_id} belongs to team ` +
         `${agent.team_id}, not ${params.team_id}`,
       );
+    }
+
+    const assetId = buildChatMemoryAssetId(params.team_id, agent.agent_id);
+
+    // 2. 缓存短路：已确认存在直接返回轻量占位（如果调用方需要实体，才回 store）
+    //    实践中调用方并不消费返回值（fire-and-forget），命中缓存时不再查 store。
+    if (this.ensuredChatMemoryAssets.has(assetId)) {
+      const cached = await this.getAssetById(assetId);
+      if (cached) return cached;
+      // 缓存脏了（被外部删除）—— 清掉重来
+      this.ensuredChatMemoryAssets.delete(assetId);
     }
 
     // 3. 拿或建 asset：先看是否已在 store（冷启动 / 其他 pod 已建），否则新建。
@@ -1506,7 +1556,9 @@ export class MetadataService {
     //    上一次可能只完成 create、bind 阶段失败；bind 有 UNIQUE 约束，重复
     //    调用无副作用。这里直接调 store 跳过 addAgentFixedAsset 的重复校验
     //    —— 我们上面已经查过 agent / asset。
-    await this.store.addAgentFixedAsset(params.agent_id, {
+    //    绑定到解析出的真实 Hub agent（agt-xxx），asset_id 仍保留记忆命名空间
+    //    的原始 id（profile 名），两者互不影响。
+    await this.store.addAgentFixedAsset(agent.agent_id, {
       asset_id: assetId,
       asset_type: "chat_memory",
       injection_mode: "summary",
