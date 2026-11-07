@@ -1,0 +1,9 @@
+allowBuilds:
+  better-sqlite3: true
+  esbuild: true
+  protobufjs: true
+  tesseract.js: true
+
+# 本地补丁：pnpm 9 要求 packages 字段，上游仅提供 allowBuilds 模板
+packages:
+  - "."

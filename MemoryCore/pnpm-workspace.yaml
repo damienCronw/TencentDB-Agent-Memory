@@ -1,9 +1,13 @@
 allowBuilds:
-  '@google/genai': set this to true or false
-  es5-ext: set this to true or false
-  esbuild: set this to true or false
-  mongodb-memory-server: set this to true or false
-  node-llama-cpp: set this to true or false
-  openclaw: set this to true or false
-  protobufjs: set this to true or false
-  tree-sitter-bash: set this to true or false
+  '@google/genai': true
+  es5-ext: true
+  esbuild: true
+  mongodb-memory-server: true
+  node-llama-cpp: true
+  openclaw: true
+  protobufjs: true
+  tree-sitter-bash: true
+
+# 本地补丁：pnpm 9 要求 packages 字段，上游仅提供 allowBuilds 模板
+packages:
+  - "."
