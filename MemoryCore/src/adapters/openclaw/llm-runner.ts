@@ -45,6 +45,7 @@ export class OpenClawLLMRunner implements LLMRunner {
       prompt: params.prompt,
       systemPrompt: params.systemPrompt,
       taskId: params.taskId,
+      model: params.model,
       timeoutMs: params.timeoutMs,
       maxTokens: params.maxTokens,
       workspaceDir: params.workspaceDir,

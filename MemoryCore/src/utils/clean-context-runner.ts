@@ -347,6 +347,12 @@ export class CleanContextRunner {
     /** Optional system prompt. When provided, `prompt` is used as the user message. */
     systemPrompt?: string;
     taskId: string;
+    /**
+     * Per-call model override. Bare name ("qwen3.5:9b-mlx") or
+     * "provider/model" — a ref carrying a provider replaces both provider and
+     * model; a bare name replaces only the model.
+     */
+    model?: string;
     timeoutMs?: number;
     maxTokens?: number;
     workspaceDir?: string;
@@ -354,6 +360,11 @@ export class CleanContextRunner {
     instanceId?: string;
   }): Promise<string> {
     const runStartMs = Date.now();
+    // Per-call model override wins over the constructor-resolved model.
+    const overrideRef = params.model ? parseModelRef(params.model) : undefined;
+    const overrideBare = params.model && !overrideRef ? params.model.trim() : undefined;
+    const effectiveProvider = overrideRef?.provider ?? this.resolvedProvider;
+    const effectiveModel = overrideRef?.model ?? overrideBare ?? this.resolvedModel;
     this.logger?.debug?.(`${TAG} run() start: taskId=${params.taskId}, timeout=${params.timeoutMs ?? 120_000}ms, tools=${this.options.enableTools ? "enabled" : "disabled"}, workspaceDir=${params.workspaceDir ?? "(default)"}`);
 
     const tmpDir = await fs.mkdtemp(
@@ -419,7 +430,7 @@ export class CleanContextRunner {
       const ts = Date.now();
       const sessionId = `memory-${params.taskId}-session-${ts}`;
       const runId = `memory-${params.taskId}-run-${ts}`;
-      this.logger?.debug?.(`${TAG} run() starting embedded agent: sessionId=${sessionId}, runId=${runId}, provider=${this.resolvedProvider ?? "(default)"}, model=${this.resolvedModel ?? "(default)"}`);
+      this.logger?.debug?.(`${TAG} run() starting embedded agent: sessionId=${sessionId}, runId=${runId}, provider=${effectiveProvider ?? "(default)"}, model=${effectiveModel ?? "(default)"}`);
 
       // [l1-debug] INVOKE — what are we about to send to the embedded agent?
       const sysPromptOverrideLen =
@@ -431,7 +442,7 @@ export class CleanContextRunner {
       const toolsAllow =
         ((cleanConfig.tools as Record<string, unknown> | undefined)?.allow as unknown[] | undefined) ?? [];
       this.logger?.debug?.(
-        `${TAG} [l1-debug] INVOKE taskId=${params.taskId}, provider=${this.resolvedProvider ?? "(default)"}, model=${this.resolvedModel ?? "(default)"}, promptLen=${effectivePrompt.length}, sysPromptOverrideLen=${sysPromptOverrideLen}, toolsAllow=${JSON.stringify(toolsAllow)}, timeoutMs=${params.timeoutMs ?? 120_000}`,
+        `${TAG} [l1-debug] INVOKE taskId=${params.taskId}, provider=${effectiveProvider ?? "(default)"}, model=${effectiveModel ?? "(default)"}, promptLen=${effectivePrompt.length}, sysPromptOverrideLen=${sysPromptOverrideLen}, toolsAllow=${JSON.stringify(toolsAllow)}, timeoutMs=${params.timeoutMs ?? 120_000}`,
       );
 
       // Phase 2: Embedded agent run (LLM call + tool calls)
@@ -450,8 +461,8 @@ export class CleanContextRunner {
         prompt: effectivePrompt,
         timeoutMs: params.timeoutMs ?? 120_000,
         runId,
-        provider: this.resolvedProvider,
-        model: this.resolvedModel,
+        provider: effectiveProvider,
+        model: effectiveModel,
         // When enableTools=false, pass disableTools:true so that no tool
         // definitions are sent to the API. This avoids polluting the LLM
         // context with tool schemas and prevents the model from attempting
@@ -512,8 +523,8 @@ export class CleanContextRunner {
         if (params.instanceId && this.logger) {
           report("llm_call", {
             taskId: params.taskId,
-            provider: this.resolvedProvider ?? "default",
-            model: this.resolvedModel ?? "default",
+            provider: effectiveProvider ?? "default",
+            model: effectiveModel ?? "default",
             inputLength: params.prompt.length,
             outputLength: 0,
             totalDurationMs: totalMs,
@@ -530,8 +541,8 @@ export class CleanContextRunner {
       if (params.instanceId && this.logger) {
         report("llm_call", {
           taskId: params.taskId,
-          provider: this.resolvedProvider ?? "default",
-          model: this.resolvedModel ?? "default",
+          provider: effectiveProvider ?? "default",
+          model: effectiveModel ?? "default",
           inputLength: params.prompt.length,
           outputLength: text.length,
           totalDurationMs: totalMs,
@@ -548,8 +559,8 @@ export class CleanContextRunner {
       if (params.instanceId && this.logger) {
         report("llm_call", {
           taskId: params.taskId,
-          provider: this.resolvedProvider ?? "default",
-          model: this.resolvedModel ?? "default",
+          provider: effectiveProvider ?? "default",
+          model: effectiveModel ?? "default",
           inputLength: params.prompt.length,
           outputLength: 0,
           totalDurationMs: totalMs,

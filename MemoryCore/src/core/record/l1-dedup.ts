@@ -164,6 +164,8 @@ async function runLlmJudgment(
         prompt: userPrompt,
         systemPrompt,
         taskId: "l1-conflict-detection",
+        // Same per-layer model override as L1 extraction.
+        model,
         timeoutMs: 180_000,
         ...traceParams,
       });

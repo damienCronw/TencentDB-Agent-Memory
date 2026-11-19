@@ -69,6 +69,13 @@ export interface LLMRunParams {
   systemPrompt?: string;
   /** Unique task identifier for logging and metrics. */
   taskId: string;
+  /**
+   * Per-call model override. Lets one injected runner serve different models
+   * per layer (e.g. L1 extraction on a small/fast model while L2/L3 stay on
+   * the premium one). Carries the raw reference — a bare model name or
+   * "provider/model" — each runner normalizes it for its own wire format.
+   */
+  model?: string;
   /** Execution timeout in milliseconds (default: 120_000). */
   timeoutMs?: number;
   /** Max output tokens (optional — defaults to model catalog value). */

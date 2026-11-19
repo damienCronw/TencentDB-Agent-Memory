@@ -21,6 +21,7 @@ import path from "node:path";
 import { APICallError, generateText, streamText, tool, stepCountIs, jsonSchema } from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { report } from "../../core/report/reporter.js";
+import { normalizeModelName } from "../../core/model-ref.js";
 import type {
   LLMRunner,
   LLMRunParams,
@@ -150,7 +151,7 @@ function createSandboxedTools(workspaceDir: string, logger?: Logger) {
           logger?.warn?.(`${TAG} read failed: ${msg}`);
           return JSON.stringify({ error: msg });
         }
-      }) as any,
+      }),
     }),
 
     write: tool({
@@ -176,7 +177,7 @@ function createSandboxedTools(workspaceDir: string, logger?: Logger) {
           logger?.warn?.(`${TAG} write failed: ${msg}`);
           return JSON.stringify({ error: msg });
         }
-      }) as any,
+      }),
     }),
 
     edit: tool({
@@ -227,7 +228,7 @@ function createSandboxedTools(workspaceDir: string, logger?: Logger) {
           logger?.warn?.(`${TAG} edit failed: ${msg}`);
           return JSON.stringify({ error: msg });
         }
-      }) as any,
+      }),
     }),
   };
 }
@@ -292,9 +293,14 @@ export class StandaloneLLMRunner implements LLMRunner {
     const callerProvidedTools = params.tools && Object.keys(params.tools).length > 0;
     const effectiveEnableTools = params.enableTools ?? this.enableTools;
     const maxIterations = params.maxIterations ?? MAX_TOOL_ITERATIONS;
+    // Per-call model override (e.g. L1 extraction on a cheaper/faster model
+    // while L2/L3 stay on the runner's default). The wire format is
+    // OpenAI-compatible, so only the model name is sent — a "provider/model"
+    // ref is reduced to its model part.
+    const effectiveModel = normalizeModelName(params.model) ?? this.model;
 
     this.logger?.debug?.(
-      `${TAG} run() start: taskId=${params.taskId}, model=${this.model}, ` +
+      `${TAG} run() start: taskId=${params.taskId}, model=${effectiveModel}, ` +
       `tools=${effectiveEnableTools}${callerProvidedTools ? "(caller)" : ""}, timeout=${timeoutMs}ms`,
     );
 
@@ -337,7 +343,7 @@ export class StandaloneLLMRunner implements LLMRunner {
         : timeoutSignal;
 
       const callParams = {
-        model: provider.chat(this.model),
+        model: provider.chat(effectiveModel),
         system: params.systemPrompt,
         prompt: params.prompt,
         // Only attach tools when actually enabled — passing an empty object
@@ -427,7 +433,7 @@ export class StandaloneLLMRunner implements LLMRunner {
         report("llm_call", {
           taskId: params.taskId,
           provider: "standalone",
-          model: this.model,
+          model: effectiveModel,
           inputLength: params.prompt.length,
           outputLength: text.length,
           totalDurationMs: totalMs,
@@ -459,7 +465,7 @@ export class StandaloneLLMRunner implements LLMRunner {
         report("llm_call", {
           taskId: params.taskId,
           provider: "standalone",
-          model: this.model,
+          model: effectiveModel,
           inputLength: params.prompt.length,
           outputLength: 0,
           totalDurationMs: totalMs,

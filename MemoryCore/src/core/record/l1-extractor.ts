@@ -515,6 +515,8 @@ async function callLlmExtraction(params: {
       prompt: userPrompt,
       systemPrompt,
       taskId: "l1-extraction",
+      // Per-layer model override (e.g. a smaller/faster model for L1).
+      model,
       timeoutMs: 180_000,
       ...traceParams,
     });

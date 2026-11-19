@@ -129,6 +129,8 @@ export class SceneExtractor {
   private promptMode: MemoryPromptMode;
   private memoryPrompt: ResolvedMemoryPrompt | undefined;
   private timeoutMs: number;
+  /** Per-layer model override (persona.model); undefined → runner's own model. */
+  private modelOverride: string | undefined;
   private logger: ExtractorLogger | undefined;
   private instanceId: string | undefined;
   private storage: StorageAdapter | undefined;
@@ -141,6 +143,7 @@ export class SceneExtractor {
     this.memoryPrompt = opts.memoryPrompt;
     this.sceneBackupCount = opts.sceneBackupCount ?? 10;
     this.timeoutMs = opts.timeoutMs ?? 300_000; // 5 min — LLM may do multiple tool calls
+    this.modelOverride = opts.model;
     this.logger = opts.logger;
     this.instanceId = opts.instanceId;
     this.storage = opts.storage;
@@ -282,6 +285,9 @@ export class SceneExtractor {
         systemPrompt,
         prompt: userPrompt,
         taskId: `scene-extract-${Date.now()}`,
+        // Per-layer model override (persona.model) — falls back to the
+        // runner's own model when unset.
+        model: this.modelOverride,
         timeoutMs: this.timeoutMs,
         // maxTokens omitted → core uses the resolved model's maxTokens from catalog
         workspaceDir: sceneBlocksDir,
