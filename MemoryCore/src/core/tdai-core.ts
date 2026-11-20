@@ -1136,6 +1136,15 @@ export class TdaiCore {
   ): Promise<{
     creditUsed: number;
     skipped: boolean;
+    /**
+     * updatedAt of the newest L1 record consumed by this run. The L2 cursor
+     * must advance to this value, not to the wall clock: L1 records written
+     * while L2 was running carry an earlier timestamp than "now" and would
+     * otherwise be skipped forever.
+     */
+    latestCursor?: string;
+    /** Batch budget hit; more L1 records remain past latestCursor. */
+    hasMore?: boolean;
     sceneDiff?: L2SceneDiffDiagnostic;
     jevGateId?: string;
   }> {
@@ -1181,6 +1190,8 @@ export class TdaiCore {
     return {
       creditUsed,
       skipped,
+      latestCursor: runnerResult?.latestCursor,
+      hasMore: runnerResult?.hasMore === true,
       sceneDiff: runnerResult?.sceneDiff,
       jevGateId: runnerResult?.jevGateId,
     };
