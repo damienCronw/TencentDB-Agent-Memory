@@ -65,6 +65,13 @@ export interface ExtractionConfig {
   maxMemoriesPerSession: number;
   /** LLM model for extraction, format: "provider/model" (falls back to OpenClaw default model when omitted) */
   model?: string;
+  /**
+   * LLM request timeout for one extraction call (ms, default: 420000).
+   * A local model queues behind concurrent sessions — a too-small timeout
+   * aborts the call and the whole batch of memories is dropped silently
+   * (`l1-empty reason=llm_error`).
+   */
+  timeoutMs?: number;
   /** Prompt family for L1 extraction (default: chat). */
   promptMode: MemoryPromptMode;
 }
@@ -657,6 +664,7 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       enableDedup: bool(extractionGroup, "enableDedup") ?? true,
       maxMemoriesPerSession: num(extractionGroup, "maxMemoriesPerSession") ?? 20,
       model: optStr(extractionGroup, "model"),
+      timeoutMs: num(extractionGroup, "timeoutMs"),
       promptMode: normalizePromptMode(str(extractionGroup, "promptMode"), globalPromptMode),
     },
     persona: {

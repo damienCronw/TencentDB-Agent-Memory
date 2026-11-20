@@ -626,6 +626,7 @@ export function createL1Runner(opts: {
             enableDedup: cfg.extraction.enableDedup,
             maxMemoriesPerSession: cfg.extraction.maxMemoriesPerSession,
             model: cfg.extraction.model,
+            extractionTimeoutMs: cfg.extraction.timeoutMs,
             promptMode: cfg.extraction.promptMode,
             memoryPrompt: l1Prompts.get(memoryPromptResolveKey({
               teamId: group.teamId,

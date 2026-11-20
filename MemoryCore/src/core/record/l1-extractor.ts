@@ -111,6 +111,13 @@ export async function extractL1Memories(params: {
     maxMemoriesPerSession?: number;
     /** LLM model override */
     model?: string;
+    /**
+     * LLM request timeout for the extraction call (milliseconds).
+     * Defaults to 420s. A local 27B model can queue behind concurrent
+     * sessions, and the old hard-coded 180s caused `l1-empty reason=llm_error`
+     * (timeout) that silently dropped whole batches of memories.
+     */
+    extractionTimeoutMs?: number;
     /** Previous scene name for continuity */
     previousSceneName?: string;
     /** Prompt family for L1 extraction (default: chat). */
@@ -200,6 +207,7 @@ export async function extractL1Memories(params: {
       config,
       logger,
       model: options.model,
+      extractionTimeoutMs: options.extractionTimeoutMs,
       promptMode: options.promptMode,
       memoryPrompt: options.memoryPrompt,
       traceContext: { teamId, userId, agentId, sessionId },
@@ -482,6 +490,8 @@ async function callLlmExtraction(params: {
   config: unknown;
   logger?: Logger;
   model?: string;
+  /** LLM request timeout for the extraction call (milliseconds). */
+  extractionTimeoutMs?: number;
   promptMode?: MemoryPromptMode;
   memoryPrompt?: ResolvedMemoryPrompt;
   /** Host-neutral LLM runner — when provided, used instead of CleanContextRunner. */
@@ -490,6 +500,9 @@ async function callLlmExtraction(params: {
   traceContext?: TraceContext;
 }): Promise<ParseExtractionOutcome> {
   const { newMessages, backgroundMessages, previousSceneName, config, logger, model, promptMode = "chat", memoryPrompt, llmRunner, traceContext } = params;
+  // 本地 27B 在并发 session 下会排队，硬编码 180s 不足以覆盖 —— 超时会让
+  // 整批记忆被静默丢弃（l1-empty reason=llm_error）。默认 420s，可配置。
+  const extractionTimeoutMs = params.extractionTimeoutMs ?? 420_000;
 
   const systemPrompt = composeMemorySystemPrompt(getExtractMemoriesSystemPrompt(promptMode), memoryPrompt);
   const userPrompt = formatExtractionPrompt({
@@ -517,7 +530,7 @@ async function callLlmExtraction(params: {
       taskId: "l1-extraction",
       // Per-layer model override (e.g. a smaller/faster model for L1).
       model,
-      timeoutMs: 180_000,
+      timeoutMs: extractionTimeoutMs,
       ...traceParams,
     });
   } else {
@@ -533,7 +546,7 @@ async function callLlmExtraction(params: {
       prompt: userPrompt,
       systemPrompt,
       taskId: "l1-extraction",
-      timeoutMs: 180_000,
+      timeoutMs: extractionTimeoutMs,
       ...traceParams,
     });
   }
