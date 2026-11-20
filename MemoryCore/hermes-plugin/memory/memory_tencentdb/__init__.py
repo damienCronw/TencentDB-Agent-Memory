@@ -93,6 +93,9 @@ _DEFAULT_USER_ID = "default"
 # 模型选型等）。各 profile 检索时先查自己的 agent 层，命中不足再回退到这里。
 _SHARED_FACT_AGENT_ID = "default"
 
+# prefetch 每轮自动注入的 L1 记忆条数上限（专属层 + 共享层合计）。
+_PREFETCH_L1_LIMIT = 5
+
 # MemoryKnowledge (wiki service) networking defaults. The wiki corpus lives in
 # a separate process from the memory Gateway, so it gets its own host/port.
 _DEFAULT_KNOWLEDGE_HOST = "127.0.0.1"
@@ -802,7 +805,7 @@ class MemoryTencentdbProvider(MemoryProvider):
                     target=_fetch,
                     args=("l1", lambda: self._client.atomic_search(
                         query=query,
-                        limit=5,
+                        limit=_PREFETCH_L1_LIMIT,
                         team_id=self._team_id,
                         agent_id=self._agent_id,
                         user_id=self._user_id,
@@ -842,10 +845,28 @@ class MemoryTencentdbProvider(MemoryProvider):
             # L1 memories
             l1_data = results.get("l1", {})
             l1_items = l1_data.get("data", {}).get("items", [])
+            # 共享事实层回退：profile 专属记忆不足时，从 default（共享事实层）
+            # 补查。prefetch 是每轮自动注入的路径 —— 没有这条回退，default 层
+            # 的通用事实永远进不了上下文，只有手动调搜索工具才能看到。
+            if len(l1_items) < _PREFETCH_L1_LIMIT and self._agent_id != _SHARED_FACT_AGENT_ID:
+                try:
+                    shared = self._client.atomic_search(
+                        query=query,
+                        limit=_PREFETCH_L1_LIMIT - len(l1_items),
+                        team_id=self._team_id,
+                        agent_id=_SHARED_FACT_AGENT_ID,
+                        user_id=self._user_id,
+                    )
+                    for m in shared.get("data", {}).get("items", []):
+                        m = dict(m)
+                        m["shared"] = True
+                        l1_items.append(m)
+                except Exception as exc:  # 回退失败不影响主路径
+                    logger.debug(f"[memory-tencentdb] prefetch shared-fact fallback failed: {exc}")
             if l1_items:
                 lines = []
                 for m in l1_items:
-                    mtype = m.get("type", "unknown")
+                    mtype = "shared" if m.get("shared") else m.get("type", "unknown")
                     content = m.get("content", "")
                     lines.append(f"- [{mtype}] {content}")
                 parts.append(
@@ -1074,7 +1095,10 @@ class MemoryTencentdbProvider(MemoryProvider):
                     user_id=self._user_id,
                 )
                 self._record_success()
-                items = result.get("data", {}).get("items", [])
+                # /v3/conversation/search 返回 data.messages（不是 data.items）。
+                # 早期读 items 导致该工具恒返回空 —— 实际数据一直存在。
+                data = result.get("data", {}) or {}
+                items = data.get("messages") or data.get("items") or []
                 if not items:
                     return "No conversations found for this query."
                 lines = []
