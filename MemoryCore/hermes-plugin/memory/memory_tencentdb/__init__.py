@@ -89,6 +89,10 @@ _DEFAULT_TEAM_ID = "team-ohgfaxy8um"
 _DEFAULT_AGENT_ID = "default"
 _DEFAULT_USER_ID = "default"
 
+# 共享事实层 agent_id：存放跨 profile 通用的事实（渲染参数、端口映射、公司背景、
+# 模型选型等）。各 profile 检索时先查自己的 agent 层，命中不足再回退到这里。
+_SHARED_FACT_AGENT_ID = "default"
+
 # MemoryKnowledge (wiki service) networking defaults. The wiki corpus lives in
 # a separate process from the memory Gateway, so it gets its own host/port.
 _DEFAULT_KNOWLEDGE_HOST = "127.0.0.1"
@@ -1020,9 +1024,10 @@ class MemoryTencentdbProvider(MemoryProvider):
                 query = args.get("query", "")
                 if not query:
                     return json.dumps({"error": "Missing required parameter: query"})
+                limit = _coerce_limit(args.get("limit"))
                 result = self._client.atomic_search(
                     query=query,
-                    limit=_coerce_limit(args.get("limit")),
+                    limit=limit,
                     type_filter=args.get("type", ""),
                     team_id=self._team_id,
                     agent_id=self._agent_id,
@@ -1031,11 +1036,30 @@ class MemoryTencentdbProvider(MemoryProvider):
                 self._record_success()
                 # Unwrap v3 envelope for LLM consumption
                 items = result.get("data", {}).get("items", [])
-                if not items:
+                # 共享事实层回退：profile 专属记忆不足时，从 default（共享事实层）
+                # 补查。default 层存放跨 profile 通用的事实（渲染参数、端口映射、
+                # 公司背景等）；profile 层仍只放该 profile 的专属记忆。
+                shared_items: List[Dict[str, Any]] = []
+                if len(items) < limit and self._agent_id != _SHARED_FACT_AGENT_ID:
+                    try:
+                        shared = self._client.atomic_search(
+                            query=query,
+                            limit=limit - len(items),
+                            type_filter=args.get("type", ""),
+                            team_id=self._team_id,
+                            agent_id=_SHARED_FACT_AGENT_ID,
+                            user_id=self._user_id,
+                        )
+                        shared_items = shared.get("data", {}).get("items", [])
+                    except Exception as exc:  # 回退失败不影响主路径
+                        logger.debug(f"[memory-tencentdb] shared-fact fallback failed: {exc}")
+                if not items and not shared_items:
                     return "No memories found for this query."
                 lines = []
                 for m in items:
                     lines.append(f"- [{m.get('type', '?')}] {m.get('content', '')}")
+                for m in shared_items:
+                    lines.append(f"- [shared] {m.get('content', '')}")
                 return "\n".join(lines)
 
             if tool_name == "memory_tencentdb_conversation_search":
