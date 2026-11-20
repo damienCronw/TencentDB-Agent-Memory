@@ -29,7 +29,7 @@ export interface LlmConfig {
    */
   mode: "proxy" | "custom";
   /** LLM 协议：openai 走 /chat/completions，anthropic 走 /messages。默认 openai（向后兼容）。 */
-  protocol: "openai" | "anthropic";
+  protocol: "openai" | "anthropic" | "ollama";
   provider: string;
   apiKey: string;
   model: string;
@@ -37,6 +37,17 @@ export interface LlmConfig {
   maxTokens: number;
   /** LLM request timeout in ms. Defaults to 1200000 (20min) — reasoning 模型需要更长时间。 */
   timeoutMs: number;
+  /**
+   * Native-Ollama options (protocol="ollama").
+   * The OpenAI-compatible /v1 endpoint silently drops `think`, so Qwen3
+   * burns its whole max_tokens budget on reasoning and returns empty content.
+   * The native /api/chat endpoint honours think:false.
+   */
+  ollama?: {
+    think?: boolean;
+    numCtx?: number;
+    temperature?: number;
+  };
   /**
    * 是否用流式请求(streamText)调用上游。默认 false(非流式)。
    * 个别只接受流式请求的兼容上游需置 true。per-instance binding 不覆盖此字段(部署级开关)。
@@ -236,12 +247,26 @@ export function loadConfig(): ServiceConfig {
     clickhouse,
     llm: {
       mode: env("LLM_MODE", "proxy") === "custom" ? "custom" : "proxy",
-      protocol: env("LLM_PROTOCOL", "openai") === "anthropic" ? "anthropic" : "openai",
+      protocol: (() => {
+        const p = env("LLM_PROTOCOL", "openai");
+        return p === "anthropic" || p === "ollama" ? p : "openai";
+      })(),
       provider: env("LLM_PROVIDER", "custom"),
       apiKey: env("LLM_API_KEY", ""),
       model: env("LLM_MODEL", "Memory-Model"),
       baseUrl: env("LLM_BASE_URL", ""),
       maxTokens: envInt("LLM_MAX_TOKENS", 32768),
+      ollama: (() => {
+        const think = process.env.LLM_OLLAMA_THINK;
+        const numCtx = envInt("LLM_OLLAMA_NUM_CTX", 0);
+        const temperature = process.env.LLM_OLLAMA_TEMPERATURE;
+        if (think === undefined && !numCtx && temperature === undefined) return undefined;
+        return {
+          think: think === undefined ? false : think !== "false",
+          ...(numCtx ? { numCtx } : {}),
+          ...(temperature !== undefined ? { temperature: Number(temperature) } : {}),
+        };
+      })(),
       timeoutMs: envInt("LLM_TIMEOUT_MS", 1200000),
       stream: process.env.LLM_STREAM === "true",
     },

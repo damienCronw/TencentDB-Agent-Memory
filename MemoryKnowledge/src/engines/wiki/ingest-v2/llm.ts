@@ -18,7 +18,7 @@ const log = createLogger("wiki-ingest-llm");
 
 /** 上层传入的原始 llmConfig（宽松，字段可能用不同命名）。 */
 export interface RawLlmConfig {
-  protocol?: "openai" | "anthropic";
+  protocol?: "openai" | "anthropic" | "ollama";
   provider?: string;
   apiKey?: string;
   model?: string;
@@ -29,6 +29,12 @@ export interface RawLlmConfig {
   baseUrl?: string;
   maxTokens?: number;
   timeoutMs?: number;
+  /** Native-Ollama options (protocol="ollama"). */
+  ollama?: {
+    think?: boolean;
+    numCtx?: number;
+    temperature?: number;
+  };
   /**
    * 是否用流式请求(streamText)调用上游。默认 false(非流式)。
    * 个别只接受流式请求的兼容上游需置 true。openai/anthropic 协议均生效。
@@ -42,13 +48,18 @@ export interface RawLlmConfig {
 
 /** 归一化后的配置。 */
 export interface NormalizedLlmConfig {
-  protocol: "openai" | "anthropic";
+  protocol: "openai" | "anthropic" | "ollama";
   baseUrl: string;
   apiKey: string;
   model: string;
   maxTokens: number;
   timeoutMs: number;
   stream: boolean;
+  ollama?: {
+    think?: boolean;
+    numCtx?: number;
+    temperature?: number;
+  };
 }
 
 const DEFAULT_MODEL = "Memory-Model";
@@ -71,7 +82,16 @@ export function normalizeLlmConfig(raw: RawLlmConfig | undefined): NormalizedLlm
   const maxTokens = cfg.maxTokens ?? cfg.maxContextSize ?? DEFAULT_MAX_TOKENS;
   const timeoutMs = cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const stream = cfg.stream ?? false;
-  return { protocol, baseUrl, apiKey, model, maxTokens, timeoutMs, stream };
+  return {
+    protocol,
+    baseUrl,
+    apiKey,
+    model,
+    maxTokens,
+    timeoutMs,
+    stream,
+    ollama: cfg.ollama,
+  };
 }
 
 export interface ChatParams {
@@ -93,6 +113,94 @@ export interface LlmClient {
   readonly config: NormalizedLlmConfig;
 }
 
+
+/**
+ * 原生 Ollama 客户端：直连 `/api/chat`。
+ *
+ * 与 AI SDK 的 OpenAI 兼容层不同，原生端点会真正执行 `think: false`，
+ * 让 Qwen3 把 max_tokens 预算全留给正文而不是 reasoning。baseUrl 允许带
+ * `/v1` 后缀，会自动剥离。
+ */
+function createNativeOllamaClient(config: NormalizedLlmConfig): LlmClient {
+  const url = `${config.baseUrl.replace(/\/+$/, "").replace(/\/v1$/, "")}/api/chat`;
+  const ollama = config.ollama ?? {};
+
+  return {
+    config,
+    async chat(params: ChatParams): Promise<string> {
+      const timeoutSignal = AbortSignal.timeout(config.timeoutMs);
+      const signal = params.abortSignal
+        ? AbortSignal.any([timeoutSignal, params.abortSignal])
+        : timeoutSignal;
+
+      const label = params.label ?? "chat";
+      const startMs = Date.now();
+      log.info(`LLM 调用开始 [${label}]`, {
+        model: config.model,
+        protocol: "ollama-native",
+        promptChars: params.system.length + params.prompt.length,
+        maxOutputTokens: params.maxOutputTokens ?? config.maxTokens,
+        timeoutMs: config.timeoutMs,
+      });
+
+      try {
+        const body = {
+          model: config.model,
+          messages: [
+            { role: "system", content: params.system },
+            { role: "user", content: params.prompt },
+          ],
+          stream: false,
+          think: ollama.think ?? false,
+          options: {
+            num_predict: params.maxOutputTokens ?? config.maxTokens,
+            ...(ollama.numCtx ? { num_ctx: ollama.numCtx } : {}),
+            ...(params.temperature !== undefined
+              ? { temperature: params.temperature }
+              : ollama.temperature !== undefined
+                ? { temperature: ollama.temperature }
+                : {}),
+          },
+        };
+        const resp = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          signal,
+        });
+        if (!resp.ok) {
+          const text = await resp.text().catch(() => "");
+          throw new Error(`ollama native /api/chat ${resp.status}: ${text.slice(0, 500)}`);
+        }
+        const data = (await resp.json()) as {
+          message?: { content?: string; thinking?: string };
+          done?: boolean;
+          eval_count?: number;
+        };
+        const text = (data.message?.content ?? "").trim();
+        const thinkingLen = (data.message?.thinking ?? "").length;
+        log.info(`LLM 调用完成 [${label}]`, {
+          ms: Date.now() - startMs,
+          protocol: "ollama-native",
+          thinkingChars: thinkingLen,
+          evalCount: data.eval_count ?? null,
+          outputChars: text.length,
+        });
+        if (!text) {
+          log.warn(`LLM 返回空文本 [${label}]`, { thinkingChars: thinkingLen });
+        }
+        return text;
+      } catch (err) {
+        log.error(`LLM 调用失败 [${label}]`, {
+          ms: Date.now() - startMs,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        throw err;
+      }
+    },
+  };
+}
+
 /**
  * 基于 AI SDK 的真实客户端。纯文本输出（不挂任何 tool，避免弱模型幻觉 tool call）。
  */
@@ -109,6 +217,14 @@ export function createLlmClient(raw: RawLlmConfig | undefined): LlmClient {
       "LLM baseUrl 未配置：proxy 模式需 TMC 为该 service_id 推送 llm_binding；" +
       "或设 LLM_MODE=custom + LLM_BASE_URL 走自带端点",
     );
+  }
+
+  // Native Ollama path — bypasses the AI SDK's OpenAI-compatible layer so the
+  // request reaches /api/chat (which honours `think`) instead of
+  // /v1/chat/completions (which silently drops it). Qwen3 burns its whole
+  // max_tokens budget on reasoning there and returns empty content.
+  if (config.protocol === "ollama") {
+    return createNativeOllamaClient(config);
   }
 
   // 按 protocol 选 AI SDK provider 工厂（两者都实现 LanguageModelV3 接口）。
