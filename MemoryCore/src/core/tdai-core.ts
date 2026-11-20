@@ -645,6 +645,8 @@ export class TdaiCore {
     maxTokens: number;
     timeoutMs: number;
     stream: boolean;
+    provider?: "openai" | "proxy" | "ollama";
+    ollama?: { think?: boolean; numCtx?: number };
   } {
     const resolved = resolveStandaloneLlmForRuntime(this.cfg.llm, this.instanceId);
     return {
@@ -654,6 +656,8 @@ export class TdaiCore {
       maxTokens: resolved.maxTokens ?? 4096,
       timeoutMs: resolved.timeoutMs ?? 120_000,
       stream: resolved.stream ?? false,
+      provider: resolved.provider,
+      ollama: resolved.ollama,
     };
   }
 
@@ -678,7 +682,7 @@ export class TdaiCore {
   private shouldOverrideRunnerFactory(useStandaloneRunner: boolean): boolean {
     if (!useStandaloneRunner || !this.cfg.llm.enabled) return false;
     if (this.hostAdapter.hostType === "openclaw") return true;
-    return this.cfg.llm.provider === "proxy";
+    return this.cfg.llm.provider === "proxy" || this.cfg.llm.provider === "ollama";
   }
 
   private wirePipelineRunners(): void {

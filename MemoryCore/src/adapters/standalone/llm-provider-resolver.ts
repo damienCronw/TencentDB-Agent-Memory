@@ -35,6 +35,8 @@ export function resolveStandaloneLlmForRuntime(
   instanceId: string | undefined,
 ): StandaloneLLMConfig {
   const provider = llm.provider ?? "openai";
+  // provider="ollama" goes straight to the native /api/chat endpoint — the
+  // baseUrl is already the Ollama root, no rewriting needed.
   if (provider !== "proxy") return llm;
 
   if (!llm.baseUrl) {

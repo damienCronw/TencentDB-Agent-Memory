@@ -112,6 +112,15 @@ export async function extractL1Memories(params: {
     /** LLM model override */
     model?: string;
     /**
+     * Per-layer transport override for the extraction call.
+     * "ollama" routes L1 through Ollama's native /api/chat endpoint, which
+     * honours `think: false` (the OpenAI-compatible /v1 path silently drops
+     * it and lets Qwen3 reasoning eat the whole output budget).
+     */
+    provider?: "openai" | "proxy" | "ollama";
+    /** Native-Ollama options for this call (only used with provider="ollama"). */
+    ollama?: { think?: boolean; numCtx?: number };
+    /**
      * LLM request timeout for the extraction call (milliseconds).
      * Defaults to 420s. A local 27B model can queue behind concurrent
      * sessions, and the old hard-coded 180s caused `l1-empty reason=llm_error`
@@ -207,6 +216,8 @@ export async function extractL1Memories(params: {
       config,
       logger,
       model: options.model,
+      provider: options.provider,
+      ollama: options.ollama,
       extractionTimeoutMs: options.extractionTimeoutMs,
       promptMode: options.promptMode,
       memoryPrompt: options.memoryPrompt,
@@ -490,6 +501,10 @@ async function callLlmExtraction(params: {
   config: unknown;
   logger?: Logger;
   model?: string;
+  /** Per-layer transport override (see options.provider). */
+  provider?: "openai" | "proxy" | "ollama";
+  /** Native-Ollama options for this call. */
+  ollama?: { think?: boolean; numCtx?: number };
   /** LLM request timeout for the extraction call (milliseconds). */
   extractionTimeoutMs?: number;
   promptMode?: MemoryPromptMode;
@@ -499,7 +514,7 @@ async function callLlmExtraction(params: {
   /** langfuse 上报身份四元组（team/user/agent/session）。 */
   traceContext?: TraceContext;
 }): Promise<ParseExtractionOutcome> {
-  const { newMessages, backgroundMessages, previousSceneName, config, logger, model, promptMode = "chat", memoryPrompt, llmRunner, traceContext } = params;
+  const { newMessages, backgroundMessages, previousSceneName, config, logger, model, provider, ollama, promptMode = "chat", memoryPrompt, llmRunner, traceContext } = params;
   // 本地 27B 在并发 session 下会排队，硬编码 180s 不足以覆盖 —— 超时会让
   // 整批记忆被静默丢弃（l1-empty reason=llm_error）。默认 420s，可配置。
   const extractionTimeoutMs = params.extractionTimeoutMs ?? 420_000;
@@ -530,6 +545,10 @@ async function callLlmExtraction(params: {
       taskId: "l1-extraction",
       // Per-layer model override (e.g. a smaller/faster model for L1).
       model,
+      // Per-layer transport override — L1 can use Ollama's native /api/chat
+      // while L2/L3 stay on the OpenAI-compatible path.
+      provider,
+      ollama,
       timeoutMs: extractionTimeoutMs,
       ...traceParams,
     });

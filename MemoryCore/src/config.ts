@@ -66,6 +66,22 @@ export interface ExtractionConfig {
   /** LLM model for extraction, format: "provider/model" (falls back to OpenClaw default model when omitted) */
   model?: string;
   /**
+   * Per-layer transport override for L1 extraction.
+   *
+   * Set to "ollama" to route L1 through Ollama's native /api/chat endpoint
+   * (honours `think: false`, so a small model like qwen3.5:9b-mlx can run
+   * without its reasoning tokens eating the whole output budget).
+   * L2/L3 always keep the OpenAI-compatible path — they need tool-calling.
+   */
+  provider?: "openai" | "proxy" | "ollama";
+  /** Native-Ollama options for L1 (only used when provider="ollama"). */
+  ollama?: {
+    /** Whether to disable thinking mode (default false). */
+    think?: boolean;
+    /** Ollama options.num_ctx (KV cache window). */
+    numCtx?: number;
+  };
+  /**
    * LLM request timeout for one extraction call (ms, default: 420000).
    * A local model queues behind concurrent sessions — a too-small timeout
    * aborts the call and the whole batch of memories is dropped silently
@@ -253,11 +269,26 @@ export interface StandaloneLLMOverrideConfig {
    * gateway 层负责在构造 runner 前把 baseUrl / apiKey 换成解析后的最终值，
    * 因此 runner 无需感知 provider 字段。
    */
-  provider?: "openai" | "proxy";
+  provider?: "openai" | "proxy" | "ollama";
   /** provider=proxy 时的可选配置。 */
   proxy?: {
-    /** 是否用 memory systemUser.userKey 作为 Authorization（默认 true）。 */
+    /** 是否用 memory 系统用户 userKey 作为 Authorization（默认 true）。 */
     useMemorySystemUserKey?: boolean;
+  };
+  /**
+   * provider=ollama 时的可选配置（原生 /api/chat 端点）。
+   *
+   * 为什么需要原生端点：Ollama 的 /v1/chat/completions 兼容端点**忽略**
+   * `think` 参数，而 Qwen3 系的 thinking token 与 content 共用同一个
+   * max_tokens 预算。9B 模型的 reasoning 常达 7000-15000 token，会把预算
+   * 吃光 → finish=length + content 为空 → 抽取结果整体丢失。
+   * 原生 /api/chat 支持 `think: false`，实测 thinking 归零、输出稳定合法。
+   */
+  ollama?: {
+    /** 是否关闭思考模式（默认 false）。thinking=false 可显著降低耗时与显存。 */
+    think?: boolean;
+    /** Ollama options.num_ctx（KV cache 窗口）。 */
+    numCtx?: number;
   };
   /**
    * 是否用流式请求(streamText)调用上游。默认 false(generateText 非流式)。
@@ -664,6 +695,18 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       enableDedup: bool(extractionGroup, "enableDedup") ?? true,
       maxMemoriesPerSession: num(extractionGroup, "maxMemoriesPerSession") ?? 20,
       model: optStr(extractionGroup, "model"),
+      provider: ((): "openai" | "proxy" | "ollama" | undefined => {
+        const p = str(extractionGroup, "provider");
+        return p === "openai" || p === "proxy" || p === "ollama" ? p : undefined;
+      })(),
+      ollama: (() => {
+        const g = obj(extractionGroup, "ollama");
+        const think = bool(g, "think");
+        const numCtx = num(g, "numCtx");
+        return think === undefined && numCtx === undefined
+          ? undefined
+          : { think: think ?? false, numCtx };
+      })(),
       timeoutMs: num(extractionGroup, "timeoutMs"),
       promptMode: normalizePromptMode(str(extractionGroup, "promptMode"), globalPromptMode),
     },
@@ -744,9 +787,10 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
     llm: (() => {
       const llmGroup = obj(c, "llm");
       const rawProvider = str(llmGroup, "provider");
-      const provider: "openai" | "proxy" =
-        rawProvider === "proxy" ? "proxy" : "openai";
+      const provider: "openai" | "proxy" | "ollama" =
+        rawProvider === "proxy" ? "proxy" : rawProvider === "ollama" ? "ollama" : "openai";
       const proxyGroup = obj(llmGroup, "proxy");
+      const ollamaGroup = obj(llmGroup, "ollama");
       return {
         enabled: bool(llmGroup, "enabled") ?? false,
         baseUrl: str(llmGroup, "baseUrl") ?? "https://api.openai.com/v1",
@@ -760,6 +804,13 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
           // 默认 true：走 proxy 时用 memory 系统用户 key 作为 Authorization。
           useMemorySystemUserKey: bool(proxyGroup, "useMemorySystemUserKey") ?? true,
         },
+        ollama: (() => {
+          const think = bool(ollamaGroup, "think");
+          const numCtx = num(ollamaGroup, "numCtx");
+          return think === undefined && numCtx === undefined
+            ? undefined
+            : { think: think ?? false, numCtx };
+        })(),
       };
     })(),
     offload,

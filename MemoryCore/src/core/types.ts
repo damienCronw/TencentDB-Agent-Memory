@@ -76,6 +76,24 @@ export interface LLMRunParams {
    * "provider/model" — each runner normalizes it for its own wire format.
    */
   model?: string;
+  /**
+   * Per-call provider override, mirroring the per-call `model` override.
+   *
+   * Lets a layer pick a different transport without changing the runner's
+   * default: e.g. L1 extraction on `provider: "ollama"` (native /api/chat,
+   * which honours `think: false`) while L2/L3 keep the OpenAI-compatible
+   * path (they need tool-calling, which the native endpoint cannot carry).
+   */
+  provider?: "openai" | "proxy" | "ollama";
+  /**
+   * Per-call native-Ollama options (only used when provider resolves to
+   * "ollama"). Lets a layer pick `think: false` without changing the
+   * runner's global default.
+   */
+  ollama?: {
+    think?: boolean;
+    numCtx?: number;
+  };
   /** Execution timeout in milliseconds (default: 120_000). */
   timeoutMs?: number;
   /** Max output tokens (optional — defaults to model catalog value). */

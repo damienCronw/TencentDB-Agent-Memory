@@ -94,12 +94,28 @@ export interface StandaloneLLMConfig {
    *   - "openai": 直连通用 OpenAI 兼容服务（默认，向后兼容）
    *   - "proxy":  走 context_proxy，运行时会自动把 baseUrl 拼成
    *               `${baseUrl}/proxy/<instanceId>/v1`，apiKey 用 metadata.systemUser.memory.userKey
+   *   - "ollama": 直连 Ollama 原生 /api/chat 端点（不经 AI SDK 的 OpenAI 兼容层）
    */
-  provider?: "openai" | "proxy";
+  provider?: "openai" | "proxy" | "ollama";
   /** provider=proxy 时的可选配置。 */
   proxy?: {
     /** 是否用 memory systemUser.userKey 作为 Authorization（默认 true）。 */
     useMemorySystemUserKey?: boolean;
+  };
+  /**
+   * provider=ollama 时的可选配置。
+   *
+   * 为什么需要原生端点：Ollama 的 /v1/chat/completions 兼容端点**忽略**
+   * `think` 参数，而 Qwen3 系的 thinking token 与 content 共用同一个
+   * max_tokens 预算。9B 模型的 reasoning 常达 7000-15000 token，会把预算
+   * 吃光 → finish=length + content 为空 → 抽取结果整体丢失。
+   * 原生 /api/chat 支持 `think: false`，实测 thinking 归零、输出稳定合法。
+   */
+  ollama?: {
+    /** 是否关闭思考模式（默认 false）。thinking=false 可显著降低耗时与显存。 */
+    think?: boolean;
+    /** Ollama options.num_ctx（KV cache 窗口）。 */
+    numCtx?: number;
   };
   /**
    * 是否用流式请求(streamText)调用上游。默认 false(generateText 非流式)。
@@ -281,6 +297,98 @@ export class StandaloneLLMRunner implements LLMRunner {
     this.logger = opts.logger;
   }
 
+  /**
+   * Native Ollama `/api/chat` call.
+   *
+   * Why this exists instead of just using the AI SDK's OpenAI-compatible
+   * provider: Ollama's `/v1/chat/completions` endpoint ignores the `think`
+   * field, and Qwen3-family models share one max_tokens budget between
+   * reasoning and content. On a 9B model the reasoning alone routinely
+   * reaches 7k-15k tokens, exhausting the budget → `finish_reason=length`
+   * with empty content → the whole extraction is lost. The native
+   * `/api/chat` endpoint honours `think: false`, which drives reasoning to
+   * zero and keeps the output short, valid JSON.
+   */
+  private async runNativeOllama(args: {
+    params: LLMRunParams;
+    model: string;
+    maxTokens: number;
+    timeoutMs: number;
+    runStartMs: number;
+  }): Promise<string> {
+    const { params, model, maxTokens, timeoutMs, runStartMs } = args;
+    const ollamaCfg = { ...(this.config.ollama ?? {}), ...(params.ollama ?? {}) };
+    const base = (this.config.baseUrl ?? "").replace(/\/+$/, "");
+    // Config may point at the OpenAI-compatible root (".../v1"); the native
+    // endpoint lives at the root, so strip a trailing /v1.
+    const nativeBase = base.replace(/\/v1$/, "");
+    const url = `${nativeBase}/api/chat`;
+
+    const messages = [
+      ...(params.systemPrompt ? [{ role: "system", content: params.systemPrompt }] : []),
+      { role: "user", content: params.prompt ?? "" },
+    ];
+
+    const body: Record<string, unknown> = {
+      model,
+      messages,
+      stream: false,
+      think: ollamaCfg.think ?? false,
+      options: {
+        num_predict: maxTokens,
+        ...(ollamaCfg.numCtx ? { num_ctx: ollamaCfg.numCtx } : {}),
+      },
+    };
+
+    this.logger?.debug?.(
+      `${TAG} native ollama → ${url} model=${model} think=${body.think} num_predict=${maxTokens}`,
+    );
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const externalSignal = params.abortSignal;
+    const onExternalAbort = () => controller.abort();
+    externalSignal?.addEventListener("abort", onExternalAbort, { once: true });
+
+    try {
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => "");
+        throw new Error(`ollama native /api/chat ${resp.status}: ${text.slice(0, 500)}`);
+      }
+      const data = (await resp.json()) as {
+        message?: { content?: string; thinking?: string };
+        done?: boolean;
+        eval_count?: number;
+      };
+      const content = data?.message?.content ?? "";
+      const thinkingLen = (data?.message as { thinking?: string } | undefined)?.thinking?.length ?? 0;
+      this.logger?.debug?.(
+        `${TAG} native ollama done in ${Date.now() - runStartMs}ms, ` +
+          `content=${content.length} chars, thinking=${thinkingLen} chars, ` +
+          `eval_count=${data?.eval_count ?? "?"}`,
+      );
+      this.lastUsage = {
+        promptTokens: 0,
+        completionTokens: data?.eval_count ?? 0,
+        totalTokens: data?.eval_count ?? 0,
+      };
+      return content;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger?.error?.(`${TAG} native ollama failed: ${message}`);
+      throw err;
+    } finally {
+      clearTimeout(timer);
+      externalSignal?.removeEventListener("abort", onExternalAbort);
+    }
+  }
+
   async run(params: LLMRunParams): Promise<string> {
     const runStartMs = Date.now();
     const timeoutMs = params.timeoutMs ?? this.config.timeoutMs ?? 120_000;
@@ -301,15 +409,36 @@ export class StandaloneLLMRunner implements LLMRunner {
 
     this.logger?.debug?.(
       `${TAG} run() start: taskId=${params.taskId}, model=${effectiveModel}, ` +
-      `tools=${effectiveEnableTools}${callerProvidedTools ? "(caller)" : ""}, timeout=${timeoutMs}ms`,
+      `tools=${effectiveEnableTools}${callerProvidedTools ? " (caller)" : ""}, timeout=${timeoutMs}ms`,
     );
+
+    // Native Ollama path — bypasses the AI SDK's OpenAI-compatible layer so the
+    // request reaches /api/chat (which honours `think`) instead of
+    // /v1/chat/completions (which silently drops it). Pure-text only: the
+    // native endpoint has no tool-calling wire format.
+    const effectiveProvider = params.provider ?? this.config.provider ?? "openai";
+    if (effectiveProvider === "ollama") {
+      if (effectiveEnableTools) {
+        throw new Error(
+          "llm.provider=ollama 仅支持纯文本任务（enableTools=false）；" +
+            "需要 tool-calling 的任务请使用 provider=openai",
+        );
+      }
+      return this.runNativeOllama({
+        params,
+        model: effectiveModel,
+        maxTokens,
+        timeoutMs,
+        runStartMs,
+      });
+    }
 
     // Create OpenAI-compatible provider via AI SDK
     // Use "compatible" mode to call /chat/completions (not Responses API),
     // which works with all OpenAI-compatible backends (DeepSeek, Qwen, etc.)
     const provider = createOpenAI({
       baseURL: this.config.baseUrl,
-      apiKey: this.config.apiKey,
+      apiKey: this.config.apiKey ?? "",
       compatibility: "compatible",
     });
 
