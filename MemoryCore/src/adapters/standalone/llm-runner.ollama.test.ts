@@ -135,20 +135,106 @@ describe("StandaloneLLMRunner — native Ollama path", () => {
     expect((body.options as Record<string, unknown>).num_ctx).toBe(8192);
   });
 
-  it("refuses tool-calling tasks (native endpoint has no tool wire format)", async () => {
-    mockFetch(() => ({ message: { content: "ok" }, done: true }));
+  it("runs a tool loop: model asks for a tool, gets the result, then answers", async () => {
+    let round = 0;
+    const spy = mockFetch((body) => {
+      round += 1;
+      if (round === 1) {
+        return {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                id: "call_1",
+                function: { name: "read_file", arguments: { path: "a.txt" } },
+              },
+            ],
+          },
+          done: true,
+          eval_count: 10,
+        };
+      }
+      // Second round: the tool result must be in the message history.
+      expect(JSON.stringify(body.messages)).toContain("tool-content");
+      return { message: { content: "final answer" }, done: true, eval_count: 5 };
+    });
 
     const runner = new StandaloneLLMRunner({
       config: { ...baseConfig, provider: "ollama" },
     });
 
-    await expect(
-      runner.run({
-        prompt: "p",
-        taskId: "l2-scene",
-        enableTools: true,
-      }),
-    ).rejects.toThrow(/provider=ollama/);
+    const out = await runner.run({
+      prompt: "p",
+      taskId: "l2-scene",
+      enableTools: true,
+      tools: {
+        read_file: {
+          description: "Read a file",
+          inputSchema: {
+            type: "object",
+            properties: { path: { type: "string" } },
+            required: ["path"],
+          },
+          execute: async () => "tool-content",
+        },
+      },
+    });
+
+    expect(out).toBe("final answer");
+    expect(spy).toHaveBeenCalledTimes(2);
+
+    // First request must advertise the tool in Ollama's own format.
+    const firstBody = bodyOf(spy, 0);
+    const wire = firstBody.tools as Array<{ function: { name: string; parameters: unknown } }>;
+    expect(wire).toHaveLength(1);
+    expect(wire[0].function.name).toBe("read_file");
+    expect(wire[0].function.parameters).toMatchObject({ type: "object" });
+
+    // Second request must carry the assistant turn and the tool result.
+    const secondBody = bodyOf(spy, 1);
+    const msgs = secondBody.messages as Array<Record<string, unknown>>;
+    const toolMsg = msgs.find((m) => m.role === "tool");
+    expect(toolMsg?.content).toBe("tool-content");
+    const assistantMsg = msgs.find((m) => m.role === "assistant");
+    expect(assistantMsg?.tool_calls).toBeDefined();
+  });
+
+  it("passes a malformed tool-arguments string as an empty object", async () => {
+    let round = 0;
+    mockFetch(() => {
+      round += 1;
+      if (round === 1) {
+        return {
+          message: {
+            content: "",
+            tool_calls: [
+              { id: "c1", function: { name: "read_file", arguments: "{not json" } },
+            ],
+          },
+          done: true,
+        };
+      }
+      return { message: { content: "ok" }, done: true };
+    });
+
+    const runner = new StandaloneLLMRunner({
+      config: { ...baseConfig, provider: "ollama" },
+    });
+
+    const out = await runner.run({
+      prompt: "p",
+      taskId: "l2-scene",
+      enableTools: true,
+      tools: {
+        read_file: {
+          description: "Read a file",
+          inputSchema: { type: "object", properties: {} },
+          execute: async () => "recovered",
+        },
+      },
+    });
+
+    expect(out).toBe("ok");
   });
 
   it("surfaces a non-200 response as an error", async () => {

@@ -93,6 +93,8 @@ export interface LLMRunParams {
   ollama?: {
     think?: boolean;
     numCtx?: number;
+    /** Sampling temperature (0.0 for deterministic extraction). */
+    temperature?: number;
   };
   /** Execution timeout in milliseconds (default: 120_000). */
   timeoutMs?: number;

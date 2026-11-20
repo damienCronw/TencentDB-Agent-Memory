@@ -80,6 +80,8 @@ export interface ExtractionConfig {
     think?: boolean;
     /** Ollama options.num_ctx (KV cache window). */
     numCtx?: number;
+    /** Sampling temperature (extraction wants 0.0 for determinism). */
+    temperature?: number;
   };
   /**
    * LLM request timeout for one extraction call (ms, default: 420000).
@@ -289,6 +291,13 @@ export interface StandaloneLLMOverrideConfig {
     think?: boolean;
     /** Ollama options.num_ctx（KV cache 窗口）。 */
     numCtx?: number;
+    /**
+     * Sampling temperature. Extraction wants determinism: at Ollama's
+     * default (0.8) the same input occasionally yields an empty `[]` or an
+     * unparseable body (measured 5/6 clean runs); at 0.0 every run returned
+     * exactly the same 5 memories.
+     */
+    temperature?: number;
   };
   /**
    * 是否用流式请求(streamText)调用上游。默认 false(generateText 非流式)。
@@ -703,9 +712,10 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
         const g = obj(extractionGroup, "ollama");
         const think = bool(g, "think");
         const numCtx = num(g, "numCtx");
-        return think === undefined && numCtx === undefined
+        const temperature = num(g, "temperature");
+        return think === undefined && numCtx === undefined && temperature === undefined
           ? undefined
-          : { think: think ?? false, numCtx };
+          : { think: think ?? false, numCtx, temperature };
       })(),
       timeoutMs: num(extractionGroup, "timeoutMs"),
       promptMode: normalizePromptMode(str(extractionGroup, "promptMode"), globalPromptMode),
@@ -807,9 +817,10 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
         ollama: (() => {
           const think = bool(ollamaGroup, "think");
           const numCtx = num(ollamaGroup, "numCtx");
-          return think === undefined && numCtx === undefined
+          const temperature = num(ollamaGroup, "temperature");
+          return think === undefined && numCtx === undefined && temperature === undefined
             ? undefined
-            : { think: think ?? false, numCtx };
+            : { think: think ?? false, numCtx, temperature };
         })(),
       };
     })(),

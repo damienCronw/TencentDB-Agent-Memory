@@ -116,6 +116,7 @@ export interface StandaloneLLMConfig {
     think?: boolean;
     /** Ollama options.num_ctx（KV cache 窗口）。 */
     numCtx?: number;
+    temperature?: number;
   };
   /**
    * 是否用流式请求(streamText)调用上游。默认 false(generateText 非流式)。
@@ -143,6 +144,88 @@ function resolveSandboxedPath(workspaceDir: string, relativePath: string): strin
 // ============================
 // Tool definitions (Vercel AI SDK `tool()` format)
 // ============================
+
+/** Parse a JSON object string, falling back to an empty object. */
+function safeParseJsonObject(text: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    // fall through — malformed arguments become an empty object, which the
+    // tool itself will reject with a proper error message.
+  }
+  return {};
+}
+
+/**
+ * One tool in the shape the native Ollama `/api/chat` endpoint expects:
+ * an OpenAI-style function descriptor plus the AI SDK execute() callback.
+ */
+interface NativeOllamaTool {
+  name: string;
+  description?: string;
+  parameters: Record<string, unknown>;
+  execute: (args: Record<string, unknown>) => Promise<string> | string;
+}
+
+/**
+ * Convert an AI SDK tool object into the OpenAI-style function descriptor
+ * Ollama expects.
+ *
+ * The AI SDK stores the JSON Schema inside `inputSchema`; depending on how
+ * the schema was declared it is either the schema object itself or a
+ * wrapper with a `jsonSchema` / `schema` / `parameters` field. We probe all
+ * of them and fall back to a permissive object schema rather than dropping
+ * the tool — a tool with a vague schema is far better than no tool at all.
+ */
+function toNativeOllamaTool(name: string, raw: unknown): NativeOllamaTool | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const t = raw as Record<string, unknown>;
+  const execute = t.execute;
+  if (typeof execute !== "function") return undefined;
+
+  const schemaSource = t.inputSchema as Record<string, unknown> | undefined;
+  let parameters: Record<string, unknown> = { type: "object", properties: {} };
+  if (schemaSource && typeof schemaSource === "object") {
+    const candidate =
+      (schemaSource.jsonSchema as Record<string, unknown> | undefined) ??
+      (schemaSource.schema as Record<string, unknown> | undefined) ??
+      (schemaSource.parameters as Record<string, unknown> | undefined) ??
+      schemaSource;
+    // A JSON-schema wrapper from the AI SDK often nests the real schema
+    // under `properties`/`type`; if we got something that looks like a
+    // schema, use it verbatim.
+    if (candidate && typeof candidate === "object") {
+      const hasSchemaShape =
+        typeof candidate.type === "string" ||
+        candidate.properties !== undefined ||
+        candidate.$schema !== undefined;
+      if (hasSchemaShape) parameters = candidate;
+    }
+  }
+
+  return {
+    name,
+    description: typeof t.description === "string" ? t.description : undefined,
+    parameters,
+    execute: execute as (args: Record<string, unknown>) => Promise<string> | string,
+  };
+}
+
+/** Convert a whole AI SDK tool record into native Ollama tool descriptors. */
+function collectNativeOllamaTools(
+  tools: Record<string, unknown> | undefined,
+): NativeOllamaTool[] {
+  if (!tools) return [];
+  const out: NativeOllamaTool[] = [];
+  for (const [name, raw] of Object.entries(tools)) {
+    const converted = toNativeOllamaTool(name, raw);
+    if (converted) out.push(converted);
+  }
+  return out;
+}
 
 function createSandboxedTools(workspaceDir: string, logger?: Logger) {
   return {
@@ -315,6 +398,8 @@ export class StandaloneLLMRunner implements LLMRunner {
     maxTokens: number;
     timeoutMs: number;
     runStartMs: number;
+    tools?: Record<string, unknown>;
+    maxIterations: number;
   }): Promise<string> {
     const { params, model, maxTokens, timeoutMs, runStartMs } = args;
     const ollamaCfg = { ...(this.config.ollama ?? {}), ...(params.ollama ?? {}) };
@@ -324,24 +409,15 @@ export class StandaloneLLMRunner implements LLMRunner {
     const nativeBase = base.replace(/\/v1$/, "");
     const url = `${nativeBase}/api/chat`;
 
-    const messages = [
+    const nativeTools = collectNativeOllamaTools(args.tools);
+    const messages: Array<Record<string, unknown>> = [
       ...(params.systemPrompt ? [{ role: "system", content: params.systemPrompt }] : []),
       { role: "user", content: params.prompt ?? "" },
     ];
 
-    const body: Record<string, unknown> = {
-      model,
-      messages,
-      stream: false,
-      think: ollamaCfg.think ?? false,
-      options: {
-        num_predict: maxTokens,
-        ...(ollamaCfg.numCtx ? { num_ctx: ollamaCfg.numCtx } : {}),
-      },
-    };
-
     this.logger?.debug?.(
-      `${TAG} native ollama → ${url} model=${model} think=${body.think} num_predict=${maxTokens}`,
+      `${TAG} native ollama → ${url} model=${model} think=${ollamaCfg.think ?? false} ` +
+        `num_predict=${maxTokens} tools=${nativeTools.length}`,
     );
 
     const controller = new AbortController();
@@ -350,35 +426,132 @@ export class StandaloneLLMRunner implements LLMRunner {
     const onExternalAbort = () => controller.abort();
     externalSignal?.addEventListener("abort", onExternalAbort, { once: true });
 
+    const toolsWire = nativeTools.map((t) => ({
+      type: "function",
+      function: {
+        name: t.name,
+        ...(t.description ? { description: t.description } : {}),
+        parameters: t.parameters,
+      },
+    }));
+
+    let totalPromptTokens = 0;
+    let totalCompletionTokens = 0;
+
     try {
-      const resp = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
-      if (!resp.ok) {
-        const text = await resp.text().catch(() => "");
-        throw new Error(`ollama native /api/chat ${resp.status}: ${text.slice(0, 500)}`);
+      // Tool loop: the model may request tools for several rounds. Each round
+      // appends the assistant turn (with its tool_calls) and one `tool` role
+      // message per call, then we ask again. Mirrors the AI SDK's
+      // stepCountIs(maxIterations) behaviour on the OpenAI-compatible path.
+      const maxRounds = nativeTools.length > 0 ? Math.max(1, args.maxIterations) : 1;
+      let finalText = "";
+
+      for (let round = 0; round < maxRounds; round++) {
+        const body: Record<string, unknown> = {
+          model,
+          messages,
+          stream: false,
+          think: ollamaCfg.think ?? false,
+          options: {
+            num_predict: maxTokens,
+            ...(ollamaCfg.numCtx ? { num_ctx: ollamaCfg.numCtx } : {}),
+            ...(ollamaCfg.temperature !== undefined
+              ? { temperature: ollamaCfg.temperature }
+              : {}),
+          },
+          ...(toolsWire.length > 0 ? { tools: toolsWire } : {}),
+        };
+
+        const resp = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        });
+        if (!resp.ok) {
+          const text = await resp.text().catch(() => "");
+          throw new Error(`ollama native /api/chat ${resp.status}: ${text.slice(0, 500)}`);
+        }
+        const data = (await resp.json()) as {
+          message?: {
+            content?: string;
+            thinking?: string;
+            tool_calls?: Array<{
+              id?: string;
+              function?: { name?: string; arguments?: unknown };
+            }>;
+          };
+          done?: boolean;
+          eval_count?: number;
+          prompt_eval_count?: number;
+        };
+
+        const message = data?.message ?? {};
+        const content = message.content ?? "";
+        const thinkingLen = message.thinking?.length ?? 0;
+        totalPromptTokens += data?.prompt_eval_count ?? 0;
+        totalCompletionTokens += data?.eval_count ?? 0;
+
+        this.logger?.debug?.(
+          `${TAG} native ollama round=${round} done in ${Date.now() - runStartMs}ms, ` +
+            `content=${content.length} chars, thinking=${thinkingLen} chars, ` +
+            `eval_count=${data?.eval_count ?? "?"}`,
+        );
+
+        const toolCalls = message.tool_calls ?? [];
+        if (toolCalls.length === 0 || toolsWire.length === 0) {
+          finalText = content;
+          break;
+        }
+
+        // Keep the assistant turn so the model sees its own tool calls.
+        messages.push({
+          role: "assistant",
+          content,
+          tool_calls: toolCalls.map((tc) => ({
+            id: tc.id,
+            type: "function",
+            function: {
+              name: tc.function?.name ?? "",
+              arguments: tc.function?.arguments ?? {},
+            },
+          })),
+        });
+
+        for (const tc of toolCalls) {
+          const name = tc.function?.name ?? "";
+          const tool = nativeTools.find((t) => t.name === name);
+          const args =
+            typeof tc.function?.arguments === "string"
+              ? safeParseJsonObject(tc.function.arguments)
+              : ((tc.function?.arguments as Record<string, unknown>) ?? {});
+          let result: string;
+          if (!tool) {
+            result = JSON.stringify({ error: `Unknown tool: ${name}` });
+          } else {
+            try {
+              result = await tool.execute(args);
+            } catch (err) {
+              result = JSON.stringify({
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
+          this.logger?.debug?.(
+            `${TAG} native ollama tool ${name}(${JSON.stringify(args).slice(0, 120)}) → ${result.length} chars`,
+          );
+          messages.push({ role: "tool", content: result, tool_name: name });
+        }
+
+        finalText = content;
       }
-      const data = (await resp.json()) as {
-        message?: { content?: string; thinking?: string };
-        done?: boolean;
-        eval_count?: number;
-      };
-      const content = data?.message?.content ?? "";
-      const thinkingLen = (data?.message as { thinking?: string } | undefined)?.thinking?.length ?? 0;
-      this.logger?.debug?.(
-        `${TAG} native ollama done in ${Date.now() - runStartMs}ms, ` +
-          `content=${content.length} chars, thinking=${thinkingLen} chars, ` +
-          `eval_count=${data?.eval_count ?? "?"}`,
-      );
+
       this.lastUsage = {
-        promptTokens: 0,
-        completionTokens: data?.eval_count ?? 0,
-        totalTokens: data?.eval_count ?? 0,
+        promptTokens: totalPromptTokens,
+        completionTokens: totalCompletionTokens,
+        totalTokens: totalPromptTokens + totalCompletionTokens,
       };
-      return content;
+      return finalText;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.logger?.error?.(`${TAG} native ollama failed: ${message}`);
@@ -412,36 +585,6 @@ export class StandaloneLLMRunner implements LLMRunner {
       `tools=${effectiveEnableTools}${callerProvidedTools ? " (caller)" : ""}, timeout=${timeoutMs}ms`,
     );
 
-    // Native Ollama path — bypasses the AI SDK's OpenAI-compatible layer so the
-    // request reaches /api/chat (which honours `think`) instead of
-    // /v1/chat/completions (which silently drops it). Pure-text only: the
-    // native endpoint has no tool-calling wire format.
-    const effectiveProvider = params.provider ?? this.config.provider ?? "openai";
-    if (effectiveProvider === "ollama") {
-      if (effectiveEnableTools) {
-        throw new Error(
-          "llm.provider=ollama 仅支持纯文本任务（enableTools=false）；" +
-            "需要 tool-calling 的任务请使用 provider=openai",
-        );
-      }
-      return this.runNativeOllama({
-        params,
-        model: effectiveModel,
-        maxTokens,
-        timeoutMs,
-        runStartMs,
-      });
-    }
-
-    // Create OpenAI-compatible provider via AI SDK
-    // Use "compatible" mode to call /chat/completions (not Responses API),
-    // which works with all OpenAI-compatible backends (DeepSeek, Qwen, etc.)
-    const provider = createOpenAI({
-      baseURL: this.config.baseUrl,
-      apiKey: this.config.apiKey ?? "",
-      compatibility: "compatible",
-    });
-
     // Select tools based on mode + storage
     // Service mode (COS): use storage-backed tools → LLM reads/writes via StorageAdapter
     // Standalone mode (local FS): use sandboxed FS tools → LLM reads/writes local files
@@ -461,6 +604,32 @@ export class StandaloneLLMRunner implements LLMRunner {
     } else {
       tools = undefined; // pure-text task — never expose any tool to the model
     }
+
+    // Native Ollama path — bypasses the AI SDK's OpenAI-compatible layer so the
+    // request reaches /api/chat (which honours `think`) instead of
+    // /v1/chat/completions (which silently drops it). The native endpoint
+    // also carries Ollama's own tool-calling format, so L2/L3 can use it too.
+    const effectiveProvider = params.provider ?? this.config.provider ?? "openai";
+    if (effectiveProvider === "ollama") {
+      return this.runNativeOllama({
+        params,
+        model: effectiveModel,
+        maxTokens,
+        timeoutMs,
+        runStartMs,
+        tools,
+        maxIterations,
+      });
+    }
+
+    // Create OpenAI-compatible provider via AI SDK
+    // Use "compatible" mode to call /chat/completions (not Responses API),
+    // which works with all OpenAI-compatible backends (DeepSeek, Qwen, etc.)
+    const provider = createOpenAI({
+      baseURL: this.config.baseUrl,
+      apiKey: this.config.apiKey ?? "",
+      compatibility: "compatible",
+    });
 
     try {
       // H-11 Step 2: combine internal timeout with caller-provided abortSignal

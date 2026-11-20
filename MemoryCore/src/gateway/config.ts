@@ -639,8 +639,9 @@ export function loadGatewayConfig(overrides?: GatewayConfigOverrides): GatewayCo
   const llmConfig = obj(fileConfig, "llm");
   const llmProxyConfig = obj(llmConfig, "proxy");
   const rawLlmProvider = env("TDAI_LLM_PROVIDER") ?? str(llmConfig, "provider");
-  const llmProvider: "openai" | "proxy" =
-    rawLlmProvider === "proxy" ? "proxy" : "openai";
+  const llmProvider: "openai" | "proxy" | "ollama" =
+    rawLlmProvider === "proxy" ? "proxy" : rawLlmProvider === "ollama" ? "ollama" : "openai";
+  const llmOllamaConfig = obj(llmConfig, "ollama");
   const llm: StandaloneLLMConfig = {
     baseUrl: env("TDAI_LLM_BASE_URL") ?? str(llmConfig, "baseUrl") ?? "https://api.openai.com/v1",
     apiKey: env("TDAI_LLM_API_KEY") ?? str(llmConfig, "apiKey") ?? "",
@@ -651,6 +652,14 @@ export function loadGatewayConfig(overrides?: GatewayConfigOverrides): GatewayCo
     proxy: {
       useMemorySystemUserKey: bool(llmProxyConfig, "useMemorySystemUserKey") ?? true,
     },
+    ollama: (() => {
+      const think = bool(llmOllamaConfig, "think");
+      const numCtx = num(llmOllamaConfig, "numCtx");
+      const temperature = num(llmOllamaConfig, "temperature");
+      return think === undefined && numCtx === undefined && temperature === undefined
+        ? undefined
+        : { think: think ?? false, numCtx, temperature };
+    })(),
     // env 存在时直接用 env 解析(可显式关闭 yaml);
     // env 未设置才回退 yaml,与其他 LLM 字段语义一致。
     stream: (() => {
@@ -692,6 +701,7 @@ export function loadGatewayConfig(overrides?: GatewayConfigOverrides): GatewayCo
       proxy: {
         useMemorySystemUserKey: llm.proxy?.useMemorySystemUserKey ?? true,
       },
+      ollama: llm.ollama,
     };
   }
 

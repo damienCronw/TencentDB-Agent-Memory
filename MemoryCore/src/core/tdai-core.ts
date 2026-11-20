@@ -646,7 +646,7 @@ export class TdaiCore {
     timeoutMs: number;
     stream: boolean;
     provider?: "openai" | "proxy" | "ollama";
-    ollama?: { think?: boolean; numCtx?: number };
+    ollama?: { think?: boolean; numCtx?: number; temperature?: number };
   } {
     const resolved = resolveStandaloneLlmForRuntime(this.cfg.llm, this.instanceId);
     return {
