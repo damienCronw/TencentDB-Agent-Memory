@@ -35,6 +35,7 @@ apart.
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import os
@@ -1192,9 +1193,56 @@ class MemoryTencentdbProvider(MemoryProvider):
 
     # -- Optional hooks -------------------------------------------------------
 
-    def on_memory_write(self, action: str, target: str, content: str) -> None:
-        """Mirror built-in memory writes to memory-tencentdb for indexing."""
-        pass
+    def on_memory_write(self, action: str, target: str, content: str,
+                        metadata: Optional[Dict[str, Any]] = None) -> None:
+        """Mirror built-in memory writes to memory-tencentdb for indexing.
+
+        Hermes' built-in ``memory`` tool writes only to the local MEMORY.md / USER.md
+        files; there is no automatic bridge to this provider.  This hook closes that
+        gap so a preference learned in one session is retrievable from TDAI in the next.
+
+        Behaviour:
+          * add / replace / patch -> write an L0 conversation turn; the v3 pipeline
+            extracts it into L1 asynchronously (~45s).
+          * remove -> NOT mirrored.  The SDK exposes no atomic-delete endpoint, and
+            writing a "this was retracted" turn would rely on the L1 model to
+            supersede the old atom, which is unreliable.  Skipping is the safe
+            behaviour: a stale memory is less harmful than a wrong one.
+
+        Never raises: a failed mirror must not break the ``memory`` tool call.
+        """
+        try:
+            if not self._client or not self._ensure_alive_for_request():
+                return
+            action = (action or "").lower()
+            if action not in ("add", "replace", "patch"):
+                logger.debug("memory-tencentdb: skip mirror for action=%s", action)
+                return
+            text = (content or "").strip()
+            if not text:
+                return
+
+            # The store may mirror a batch: keep only this op's own text.
+            ts = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            label = "偏好" if target == "user" else "环境事实"
+            messages = [
+                {"role": "user",
+                 "content": f"请记住这条{label}约定：{text}",
+                 "timestamp": ts},
+                {"role": "assistant",
+                 "content": f"已记住：{text}",
+                 "timestamp": ts},
+            ]
+            self._client.conversation_add(
+                messages,
+                session_id=f"hermes-memory-{target}",
+                team_id=self._team_id,
+                agent_id=self._agent_id,
+                user_id=self._user_id,
+            )
+            logger.info("memory-tencentdb: mirrored %s -> TDAI (target=%s)", action, target)
+        except Exception as e:
+            logger.warning("memory-tencentdb: mirror failed (%s): %s", action, e)
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Trigger session-level flush on the Gateway.
