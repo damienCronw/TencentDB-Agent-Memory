@@ -1222,7 +1222,6 @@ class MemoryTencentdbProvider(MemoryProvider):
             if not text:
                 return
 
-            # The store may mirror a batch: keep only this op's own text.
             ts = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
             label = "偏好" if target == "user" else "环境事实"
             messages = [
