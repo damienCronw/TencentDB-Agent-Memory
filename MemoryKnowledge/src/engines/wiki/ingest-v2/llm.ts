@@ -140,9 +140,9 @@ function createNativeOllamaClient(config: NormalizedLlmConfig): LlmClient {
   const url = `${config.baseUrl.replace(/\/+$/, "").replace(/\/v1$/, "")}/api/chat`;
   const ollama = config.ollama ?? {};
 
-  return {
+  const impl = {
     config,
-    async chat(params: ChatParams): Promise<string> {
+    async chatWithMeta(params: ChatParams): Promise<ChatResult> {
       const timeoutSignal = AbortSignal.timeout(config.timeoutMs);
       const signal = params.abortSignal
         ? AbortSignal.any([timeoutSignal, params.abortSignal])
@@ -190,21 +190,25 @@ function createNativeOllamaClient(config: NormalizedLlmConfig): LlmClient {
         const data = (await resp.json()) as {
           message?: { content?: string; thinking?: string };
           done?: boolean;
+          done_reason?: string;
           eval_count?: number;
         };
         const text = (data.message?.content ?? "").trim();
         const thinkingLen = (data.message?.thinking ?? "").length;
+        // ollama 的 done_reason: "stop" 正常结束，"length" 表示被 max_tokens 截断
+        const finishReason = data.done_reason ?? null;
         log.info(`LLM 调用完成 [${label}]`, {
           ms: Date.now() - startMs,
           protocol: "ollama-native",
           thinkingChars: thinkingLen,
           evalCount: data.eval_count ?? null,
+          finishReason,
           outputChars: text.length,
         });
         if (!text) {
-          log.warn(`LLM 返回空文本 [${label}]`, { thinkingChars: thinkingLen });
+          log.warn(`LLM 返回空文本 [${label}]`, { thinkingChars: thinkingLen, finishReason });
         }
-        return text;
+        return { text, finishReason };
       } catch (err) {
         log.error(`LLM 调用失败 [${label}]`, {
           ms: Date.now() - startMs,
@@ -212,6 +216,14 @@ function createNativeOllamaClient(config: NormalizedLlmConfig): LlmClient {
         });
         throw err;
       }
+    },
+  };
+
+  return {
+    config: impl.config,
+    chatWithMeta: impl.chatWithMeta,
+    async chat(params: ChatParams): Promise<string> {
+      return (await impl.chatWithMeta(params)).text;
     },
   };
 }
